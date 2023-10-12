@@ -39,6 +39,8 @@ struct PacketRange
     void push(int32_t id) noexcept { ids.push_back(id); }
     void printErrors() noexcept
     {
+        if (ids.empty())
+            return;
         int32_t lastKnownId = ids[0];
         for (size_t i = 1; i < ids.size(); ++i)
         {
