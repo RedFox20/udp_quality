@@ -552,21 +552,28 @@ struct UDPQuality
                     {
                         printServerSummary(packet);
                     }
+                    range.printErrors();
+                    range.reset();
                 }
-                range.printErrors();
-                range.reset();
             }
 
             if (packet.sender == SenderType::CLIENT)
             {
-                ++dataReceived;
-                range.push(packet.seqid);
+                if (packet.type == PacketType::DATA)
+                {
+                    ++dataSent;
+                    range.push(packet.seqid);
+                }
                 // forward the packet to the server
                 if (!sendPacketTo(reinterpret_cast<Packet*>(buffer), received, serverAddr))
                     LogError(ORANGE("Failed to forward packet: %d  %s"), packet.seqid, serverAddr.str());
             }
             else if (packet.sender == SenderType::SERVER)
             {
+                if (packet.type == PacketType::DATA)
+                {
+                    ++dataReceived;
+                }
                 // send packet to client
                 if (!clientAddr.is_valid() || !sendPacketTo(reinterpret_cast<Packet*>(buffer), received, clientAddr))
                     LogError(ORANGE("send to client failed: %d  %s"), packet.seqid, clientAddr.str());
