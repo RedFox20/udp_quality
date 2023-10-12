@@ -429,7 +429,10 @@ struct UDPQuality
         else                           LogInfo(RED(   "   Client LOSS:     %.2f%%"), lossPercent);
         LogInfo("===================================================");
         LogInfo("");
-        range.printErrors();
+        if (whoami == SenderType::SERVER)
+        {
+            range.printErrors();
+        }
     }
 
     void server() noexcept
