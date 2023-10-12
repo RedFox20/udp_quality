@@ -29,6 +29,7 @@ struct Args
     rpp::ipaddress4 listenerAddr;
     rpp::ipaddress serverAddr;
     rpp::ipaddress bridgeForwardAddr;
+    rpp::ipaddress bridgeForwardAddr;
     bool blocking = true;
     bool echo = true;
     bool udpc = false;
@@ -39,6 +40,7 @@ static Args args;
 void printHelp(int exitCode) noexcept
 {
     printf("Usage Client: ./udp_quality --address <ip:port> --size <burst_size> --rate <bytes_per_sec> --buf <socket_buf_size>\n");
+    printf("Usage Client: ./udp_quality --address <ip:port> --size <burst_size> --rate <bytes_per_sec> --buf <socket_buf_size>\n");
     printf("Usage Server: ./udp_quality --listen <listen_port> --buf <socket_buf_size>\n");
     printf("Usage Bridge: ./udp_quality --bridge <server:port> --buf <socket_buf_size>\n");
     printf("Details:\n");
@@ -48,6 +50,7 @@ void printHelp(int exitCode) noexcept
     printf("Options:\n");
     printf("    --listen <listen_port>   Server listens on this port\n");
     printf("    --address <ip:port>      Client connects to this server\n");
+    printf("    --bridge <server:port>   Client connects to this bridge packets are forwarded to server\n");
     printf("    --bridge <server:port>   Client connects to this bridge packets are forwarded to server\n");
     printf("    --size <bytes_per_burst> Client sends this many bytes per burst [default 1MB]\n");
     printf("    --rate <bytes_per_sec>   Client/Server rate limits, use 0 to disable [default]\n");
@@ -90,6 +93,7 @@ enum class SenderType : int8_t
     UNKNOWN = 0,
     SERVER = 1,
     CLIENT = 2,
+    BRIDGE = 3,
     BRIDGE = 3,
 };
 
@@ -617,6 +621,8 @@ int main(int argc, char *argv[])
     } else if (is_bridge && !args.bridgeForwardAddr.is_valid()) {
         LogError("invalid bridge <ip:port>: '%s'", args.bridgeForwardAddr.str());
         printHelp(1);
+    } else {
+        printHelp(1);
     }
 
 
@@ -639,9 +645,12 @@ int main(int argc, char *argv[])
     udp.setBufSize(rpp::socket::BO_Send, args.sndBufSize);
     udp.balancer.set_max_bytes_per_sec(args.bytesPerSec);
 
-    if (is_server) LogInfo("\x1b[0mServer listening on port %d", args.listenerAddr.port());
-    else           LogInfo("\x1b[0mClient connecting to server %s", args.serverAddr.str());
-    if (is_server) udp.server();
-    else           udp.client();
+    if      (is_server) LogInfo("\x1b[0mServer listening on port %d", args.listenerAddr.port());
+    else if (is_client) LogInfo("\x1b[0mClient connecting to server %s", args.serverAddr.str());
+    else if (is_bridge) LogInfo("\x1b[0mBridging to serverr %s", args.bridgeForwardAddr.str());
+    if      (is_server) udp.server();
+    else if (is_client) udp.client();
+    else if (is_bridge) udp.bridge();
+    else                printHelp(1);
     return 0;
 }
