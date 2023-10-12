@@ -540,6 +540,7 @@ struct UDPQuality
                 // client has sent init? then we need to reset our counters
                 if (packet.sender == SenderType::CLIENT)
                 {
+                    LogInfo("   BRIDGE %s -> %s", from.str(), serverAddr.str());
                     if (packet.status == StatusType::INIT)
                     {
                         dataReceived = 0;
@@ -561,13 +562,13 @@ struct UDPQuality
                 ++dataReceived;
                 range.push(packet.seqid);
                 // forward the packet to the server
-                if (!sendPacketTo(&packet, received, serverAddr))
+                if (!sendPacketTo(reinterpret_cast<Packet*>(buffer), received, serverAddr))
                     LogError(ORANGE("Failed to forward packet: %d  %s"), packet.seqid, serverAddr.str());
             }
             else if (packet.sender == SenderType::SERVER)
             {
                 // send packet to client
-                if (!sendPacketTo(&packet, received, clientAddr))
+                if (!clientAddr.is_valid() || !sendPacketTo(reinterpret_cast<Packet*>(buffer), received, clientAddr))
                     LogError(ORANGE("send to client failed: %d  %s"), packet.seqid, clientAddr.str());
             }
         }
