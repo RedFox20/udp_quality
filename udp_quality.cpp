@@ -29,6 +29,7 @@ struct Args
     rpp::ipaddress4 listenerAddr;
     rpp::ipaddress serverAddr;
     bool blocking = true;
+    bool echo = true;
     bool udpc = false;
 };
 
@@ -48,6 +49,7 @@ void printHelp(int exitCode) noexcept
     printf("    --rcvbuf <rcv_buf_size>  Socket RCV buffer size [default 256KB]\n");
     printf("    --blocking               Uses blocking sockets [default]\n");
     printf("    --nonblocking            Uses nonblocking sockets\n");
+    printf("    --noecho                 CLIENT: disables echo and only measures 1-way drop rate\n");
     printf("    --udpc                   Uses alternative UDP C socket implementation\n");
     printf("    --help\n");
     printf("\n");
@@ -62,21 +64,21 @@ void printHelp(int exitCode) noexcept
     exit(1);
 }
 
-enum class PacketType : int32_t
+enum class PacketType : int8_t
 {
     UNKNOWN = 0,
     DATA = 1,
     STATUS = 2
 };
 
-enum class StatusType : int32_t
+enum class StatusType : int8_t
 {
     INIT = 0,
     FINISHED = 1,
     RUNNING = 2,
 };
 
-enum class SenderType : int32_t
+enum class SenderType : int8_t
 {
     UNKNOWN = 0,
     SERVER = 1,
@@ -118,6 +120,9 @@ static const char* to_string(SenderType type) noexcept
 struct Packet
 {
     PacketType type = PacketType::DATA; // DATA or STATUS?
+    uint8_t __reserved1;
+    uint8_t __reserved2;
+    uint8_t __reserved3;
     int32_t seqid = 0; // sequence id of this packet
 };
 
@@ -125,6 +130,8 @@ struct Status : Packet
 {
     StatusType status;
     SenderType sender;
+    uint8_t echo; // 0 or 1
+    uint8_t __reserved;
 
     // server: packets that we've echoed back
     // client: packets that we've initiated
@@ -161,6 +168,7 @@ struct UDPQuality
     SenderType whoami = SenderType::SERVER;
     int32_t dataSent = 0;
     int32_t dataReceived = 0;
+    bool echo = true;
     char buffer[4096];
 
     UDPQuality() = default;
@@ -189,6 +197,7 @@ struct UDPQuality
         st.seqid = statusSeqId++;
         st.status = status;
         st.sender = whoami;
+        st.echo = echo;
         st.packetsSent = dataSent;
         st.packetsReceived = dataReceived;
         st.maxBytesPerSecond = balancer.get_max_bytes_per_sec();
@@ -296,9 +305,11 @@ struct UDPQuality
     void client() noexcept
     {
         whoami = SenderType::CLIENT;
+        echo = args.echo;
+
         int32_t burstWriteCount = args.bytesPerBurst / DATA_PACKET_SIZE;
         const int iterations = 5;
-        char buffer[4096];
+        Status lastServerStatus; // last known status sent by Server
 
         if (!sendStatusPacket(StatusType::INIT, args.serverAddr))
             LogErrorExit(RED("Failed to send INIT packet"));
@@ -339,16 +350,16 @@ struct UDPQuality
 
             while (true)
             {
-                if (start.elapsed_ms() >= 2000) {
+                if (start.elapsed_ms() >= 5000) {
                     LogInfo(RED("Timeout waiting data from SERVER. Our STATUS didn't arrive to server?"));
-                    range.printErrors();
+                    if (echo) range.printErrors();
                     break;
                 }
 
                 int r = recvPacketFrom(buffer, sizeof(buffer), actualServer, /*timeoutMillis*/100);
                 if (r == 0) continue; // no data available, continue waiting
                 if (r < 0) {
-                    range.printErrors();
+                    if (echo) range.printErrors();
                     break; // error
                 }
 
@@ -363,9 +374,20 @@ struct UDPQuality
                 {
                     Status& st = *reinterpret_cast<Status*>(buffer);
                     printStatus("recv", st);
-                    range.printErrors();
-                    if (dataSent != dataReceived)
-                        LogInfo(ORANGE("Client DIDNT RECEIVE BACK %d packets"), dataSent - dataReceived);
+                    lastServerStatus = st;
+
+                    if (echo) range.printErrors();
+
+                    if (echo) // if echo is enabled, we should have received the same number of packets
+                    {
+                        if (dataSent != dataReceived)
+                            LogInfo(ORANGE("Client DIDNT RECEIVE BACK %d packets"), dataSent - dataReceived);
+                    }
+                    else // otherwise we simply check if server received count is the same as ours
+                    {
+                        if (dataSent != st.packetsReceived)
+                            LogInfo(ORANGE("Server DIDNT RECEIVE %d packets"), dataSent - st.packetsReceived);
+                    }
                     break; // GOT STATUS, we're done
                 }
             }
@@ -373,23 +395,42 @@ struct UDPQuality
 
         sendStatusPacket(StatusType::FINISHED, actualServer);
         rpp::sleep_ms(1000); // wait for all packets to be sent
-        printSummary();
+        printClientSummary(lastServerStatus);
     }
 
-    void printSummary()
+    void printClientSummary(Status& lastServerSt) noexcept
     {
-        float sent_rate = 100.0f * (float(dataReceived) / dataSent);
-        float loss_rate = 100.0f - sent_rate;
-        if      (sent_rate > 99.99f) LogInfo(GREEN( "Client SENT:     %.2f%%"), sent_rate);
-        else if (sent_rate > 90.0f)  LogInfo(ORANGE("Client SENT:     %.2f%%"), sent_rate);
-        else                         LogInfo(RED(   "Client SENT:     %.2f%%"), sent_rate);
-        if      (loss_rate < 0.01f)  LogInfo(GREEN( "Client LOSS:     %.2f%%"), loss_rate);
-        else if (loss_rate < 10.0f)  LogInfo(ORANGE("Client LOSS:     %.2f%%"), loss_rate);
-        else                         LogInfo(RED(   "Client LOSS:     %.2f%%"), loss_rate);
+        // if echo is enabled, we count `dataReceived`, otherwise we count server `packetsReceived`
+        int32_t received = echo ? dataReceived : lastServerSt.packetsReceived;
+        float sentPercent = 100.0f * (float(received) / dataSent);
+        float lossPercent = 100.0f - sentPercent;
+        if      (sentPercent > 99.99f) LogInfo(GREEN( "Client SENT:     %.2f%%"), sentPercent);
+        else if (sentPercent > 90.0f)  LogInfo(ORANGE("Client SENT:     %.2f%%"), sentPercent);
+        else                           LogInfo(RED(   "Client SENT:     %.2f%%"), sentPercent);
+        if      (lossPercent < 0.01f)  LogInfo(GREEN( "Client LOSS:     %.2f%%"), lossPercent);
+        else if (lossPercent < 10.0f)  LogInfo(ORANGE("Client LOSS:     %.2f%%"), lossPercent);
+        else                           LogInfo(RED(   "Client LOSS:     %.2f%%"), lossPercent);
         LogInfo("=============================================\n");
     }
 
-    void server()
+    void printServerSummary(Status& lastClientSt) noexcept
+    {
+        // if echo is on, we use Client reported packetsReceived, otherwise we simply count what arrived in server
+        int32_t received = echo ? lastClientSt.packetsReceived : dataReceived;
+        float sentPercent = 100.0f * (float(received) / lastClientSt.packetsSent);
+        float lossPercent = 100.0f - sentPercent;
+        if      (sentPercent > 99.99f) LogInfo(GREEN( "   Client SENT:     %.2f%%"), sentPercent);
+        else if (sentPercent > 90.0f)  LogInfo(ORANGE("   Client SENT:     %.2f%%"), sentPercent);
+        else                           LogInfo(RED(   "   Client SENT:     %.2f%%"), sentPercent);
+        if      (lossPercent < 0.01f)  LogInfo(GREEN( "   Client LOSS:     %.2f%%"), lossPercent);
+        else if (lossPercent < 10.0f)  LogInfo(ORANGE("   Client LOSS:     %.2f%%"), lossPercent);
+        else                           LogInfo(RED(   "   Client LOSS:     %.2f%%"), lossPercent);
+        LogInfo("===================================================");
+        LogInfo("");
+        range.printErrors();
+    }
+
+    void server() noexcept
     {
         whoami = SenderType::SERVER;
         rpp::ipaddress clientAddr;
@@ -417,10 +458,13 @@ struct UDPQuality
             {
                 ++dataReceived;
                 range.push(packet->seqid);
-                if (sendPacketTo(packet, recvlen, clientAddr))
-                    ++dataSent;
-                else
-                    LogInfo(ORANGE("Failed to echo packet: %d"), packet->seqid);
+                if (echo)
+                {
+                    if (sendPacketTo(packet, recvlen, clientAddr))
+                        ++dataSent;
+                    else
+                        LogInfo(ORANGE("Failed to echo packet: %d"), packet->seqid);
+                }
             }
             else if (packet->type == PacketType::STATUS)
             {
@@ -432,6 +476,7 @@ struct UDPQuality
                     dataReceived = 0;
                     dataSent = 0;
                     statusSeqId = 0;
+                    echo = st.echo != 0;
 
                     printStatus("recv", st);
                     sendStatusPacket(StatusType::INIT, clientAddr); // echo back the init handshake
@@ -449,18 +494,7 @@ struct UDPQuality
                     LogInfo("|-------------------------------------------------|");
                     printStatus("recv", st);
                     sendStatusPacket(StatusType::FINISHED, clientAddr); // echo back the finished handshake
-                    float sent_rate = 100.0f * (float(st.packetsReceived) / st.packetsSent);
-                    float loss_rate = 100.0f - sent_rate;
-                    if      (sent_rate > 99.99f) LogInfo(GREEN( "   Client SENT:     %.2f%%"), sent_rate);
-                    else if (sent_rate > 90.0f)  LogInfo(ORANGE("   Client SENT:     %.2f%%"), sent_rate);
-                    else                         LogInfo(RED(   "   Client SENT:     %.2f%%"), sent_rate);
-                    if      (loss_rate < 0.01f)  LogInfo(GREEN( "   Client LOSS:     %.2f%%"), loss_rate);
-                    else if (loss_rate < 10.0f)  LogInfo(ORANGE("   Client LOSS:     %.2f%%"), loss_rate);
-                    else                         LogInfo(RED(   "   Client LOSS:     %.2f%%"), loss_rate);
-                    LogInfo("===================================================");
-                    LogInfo("");
-                    range.printErrors();
-                    range.reset();
+                    printServerSummary(st);
                 }
                 else if (st.status == StatusType::RUNNING)
                 {
@@ -471,7 +505,7 @@ struct UDPQuality
                     range.reset();
                     if (st.packetsSent != dataReceived)
                         LogInfo(ORANGE("   Server DIDNT RECEIVE %d packets"), st.packetsSent - dataReceived);
-                    if (dataSent != dataReceived)
+                    if (echo && dataSent != dataReceived)
                         LogInfo(ORANGE("   Server DIDNT ECHO %d packets"), dataReceived - dataSent);
                 }
             }
@@ -497,6 +531,7 @@ int main(int argc, char *argv[])
         else if (arg == "--sndbuf")  args.sndBufSize = parseSizeLiteral(next_arg(&i));
         else if (arg == "--blocking")    args.blocking = true;
         else if (arg == "--nonblocking") args.blocking = false;
+        else if (arg == "--noecho")      args.echo = false;
         else if (arg == "--udpc")        args.udpc = true;
         else if (arg == "--help") printHelp(0);
         else                      printHelp(1);
