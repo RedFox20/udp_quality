@@ -23,6 +23,9 @@
     #include <netinet/tcp.h>
     #include <arpa/inet.h>
     #include <netdb.h>
+    #include <poll.h>
+    #include <fcntl.h>
+    #include <sys/ioctl.h>
 #endif
 
 #if _WIN32
@@ -79,10 +82,10 @@ void socket_set_blocking(int socket, bool is_blocking) noexcept
         if (ioctlsocket(socket, FIONBIO, &val) != 0)
             LogErrorExit("Error setting socket to nonblocking");
     #else
-        int flags = fcntl(Sock, F_GETFL, 0);
+        int flags = fcntl(socket, F_GETFL, 0);
         if (flags < 0) flags = 0;
         flags = is_blocking ? (flags & ~O_NONBLOCK) : (flags | O_NONBLOCK);
-        if (fcntl(Sock, F_SETFL, flags) != 0)
+        if (fcntl(socket, F_SETFL, flags) != 0)
             LogErrorExit("Error setting socket to nonblocking");
     #endif
 }
@@ -94,7 +97,7 @@ void socket_set_buf_size(int socket, int so_buf, int buf_size) noexcept
     // NOTE: on linux the kernel doubles buffsize for internal bookkeeping
     //       so to keep things consistent between platforms, we divide by 2 on linux:
     int size_cmd = static_cast<int>(buf_size / 2);
-    int so_buf_force = (opt == BO_Recv ? SO_RCVBUFFORCE : SO_SNDBUFFORCE);
+    int so_buf_force = (so_buf == SO_RCVBUF ? SO_RCVBUFFORCE : SO_SNDBUFFORCE);
 #else
     int size_cmd = static_cast<int>(buf_size);
     int so_buf_force = 0;

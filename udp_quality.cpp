@@ -231,7 +231,7 @@ struct UDPQuality
 
         Packet& packet = *reinterpret_cast<Packet*>(buffer);
         if (packet.type != PacketType::STATUS) {
-            LogError(RED("recv STATUS invalid packet.type:%d from: %s"), packet.type, socket.last_err());
+            LogError(RED("recv STATUS invalid packet.type:%d from: %s"), int(packet.type), socket.last_err());
             return nullptr;
         }
         Status* st = reinterpret_cast<Status*>(buffer);
@@ -283,7 +283,7 @@ struct UDPQuality
         if (finalSize == bufSize)
             LogInfo(GREEN("set %s to %s SUCCEEDED"), name, toLiteral(bufSize));
         else
-            LogError(RED("set %s to %s failed (remains %d): %s"),
+            LogError(RED("set %s to %s failed (remains %s): %s"),
                     name, toLiteral(bufSize), toLiteral(finalSize), rpp::socket::last_os_socket_err());
         return finalSize == bufSize;
     }
