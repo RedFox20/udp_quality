@@ -3,13 +3,28 @@
 // The server will also send back Status on how many packets it has received and sent
 // The client will simply collect back the Status packets from the server
 #include "udp_quality.h"
-#include "socket_udp.h" // for --udpc option
+#include "simple_udp.h" // for --udpc option
+
+#if __linux__
+    #include <sys/socket.h>
+#endif
+#if _WIN32
+    #define WIN32_LEAN_AND_MEAN
+    #include <Windows.h>
+    #include <WinSock2.h>
+    #ifdef _MSC_VER
+        #pragma comment(lib, "Ws2_32.lib") // link against winsock libraries
+        #pragma comment(lib, "Iphlpapi.lib")
+    #endif
+#endif
 
 #define MTU_SIZE 1000 // 1000 is the default MTU size for our RTPh264 protocol
 
 struct Args
 {
-    int32_t bufSize = parseBytes("256KB");
+    int32_t rcvBufSize = parseSizeLiteral("256KB");
+    int32_t sndBufSize = parseSizeLiteral("256KB");
+    int32_t bytesPerBurst = parseSizeLiteral("1MB");
     int32_t bytesPerSec = 0;
     rpp::ipaddress4 listenerAddr;
     rpp::ipaddress serverAddr;
@@ -24,13 +39,16 @@ void printHelp(int exitCode) noexcept
     printf("Usage Server: ./udp_quality --listen <listen_port> --buf <socket_buf_size>\n");
     printf("Usage Client: ./udp_quality --address <ip:port> --rate <bytes_per_sec> --buf <socket_buf_size>\n");
     printf("Options:\n");
-    printf("    --listen <listen_port>  Server listens on this port\n");
-    printf("    --address <ip:port>     Client connects to this server\n");
-    printf("    --rate <bytes_per_sec>  Client/Server rate limits, use 0 to disable [default]\n");
-    printf("    --buf <socket_buf_size> Socket buffer size [default 256KB]\n");
-    printf("    --blocking              Uses blocking sockets [default]\n");
-    printf("    --nonblocking           Uses nonblocking sockets\n");
-    printf("    --udpc                  Uses alternative UDP C socket implementation\n");
+    printf("    --listen <listen_port>   Server listens on this port\n");
+    printf("    --address <ip:port>      Client connects to this server\n");
+    printf("    --size <bytes_per_burst> Client sends this many bytes per burst [default 1MB]\n");
+    printf("    --rate <bytes_per_sec>   Client/Server rate limits, use 0 to disable [default]\n");
+    printf("    --buf <buf_size>         Socket SND/RCV buffer size [default 256KB]\n");
+    printf("    --sndbuf <snd_buf_size>  Socket SND buffer size [default 256KB]\n");
+    printf("    --rcvbuf <rcv_buf_size>  Socket RCV buffer size [default 256KB]\n");
+    printf("    --blocking               Uses blocking sockets [default]\n");
+    printf("    --nonblocking            Uses nonblocking sockets\n");
+    printf("    --udpc                   Uses alternative UDP C socket implementation\n");
     printf("    --help\n");
     printf("\n");
     printf("When running from ubuntu, sudo is required\n");
@@ -46,8 +64,9 @@ void printHelp(int exitCode) noexcept
 
 enum class PacketType : int32_t
 {
-    DATA = 0,
-    STATUS = 1
+    UNKNOWN = 0,
+    DATA = 1,
+    STATUS = 2
 };
 
 enum class StatusType : int32_t
@@ -57,9 +76,55 @@ enum class StatusType : int32_t
     RUNNING = 2,
 };
 
-struct Status
+enum class SenderType : int32_t
 {
-    StatusType type;
+    UNKNOWN = 0,
+    SERVER = 1,
+    CLIENT = 2,
+};
+
+static const char* to_string(PacketType type) noexcept
+{
+    switch (type)
+    {
+        case PacketType::DATA:   return "DATA";
+        case PacketType::STATUS: return "STATUS";
+        default: return "UNKNOWN";
+    }
+}
+
+static const char* to_string(StatusType type) noexcept
+{
+    switch (type)
+    {
+        case StatusType::INIT:     return "INIT";
+        case StatusType::FINISHED: return "FINISHED";
+        case StatusType::RUNNING:  return "RUNNING";
+        default: return "UNKNOWN";
+    }
+}
+
+static const char* to_string(SenderType type) noexcept
+{
+    switch (type)
+    {
+        case SenderType::SERVER: return "Server";
+        case SenderType::CLIENT: return "Client";
+        default: return "UNKNOWN";
+    }
+}
+
+
+struct Packet
+{
+    PacketType type = PacketType::DATA; // DATA or STATUS?
+    int32_t seqid = 0; // sequence id of this packet
+};
+
+struct Status : Packet
+{
+    StatusType status;
+    SenderType sender;
 
     // server: packets that we've echoed back
     // client: packets that we've initiated
@@ -71,157 +136,131 @@ struct Status
 
     // sets the load balancer bytes per second limit
     int32_t maxBytesPerSecond;
-} ;
-
-struct Header
-{
-    PacketType type = PacketType::DATA; // DATA or STATUS?
-    int32_t len = 0; // size of this packet
-    int32_t seqid = 0; // sequence id of this packet
 };
 
-#define STATUS_PACKET_SIZE (sizeof(Status) + sizeof(Header))
-#define DATA_PACKET_SIZE (MTU_SIZE)
-#define DATA_BUFFER_SIZE (DATA_PACKET_SIZE - sizeof(Header))
+static constexpr int STATUS_PACKET_SIZE = sizeof(Status);
+static constexpr int DATA_PACKET_SIZE = MTU_SIZE; // limit Header + Buffer to MTU size
+static constexpr int DATA_BUFFER_SIZE = (DATA_PACKET_SIZE - sizeof(Packet));
 
-struct Packet
+struct Data : Packet
 {
-    Header header;
-    union {
-        Status status;
-        char buffer[DATA_BUFFER_SIZE];
-    };
+    char buffer[DATA_BUFFER_SIZE];
 };
+
 
 struct UDPQuality
 {
     rpp::socket socket;
-    int c_sock = -1;
+    int c_sock = -1; // simplified socket interface
+
+    // rate limiter
     rpp::load_balancer balancer { uint32_t(8 * 1024 * 1024) };
-    int32_t socketBufSize = 0;
+
+    PacketRange range{};
+    int32_t statusSeqId = 0;
+    SenderType whoami = SenderType::SERVER;
+    int32_t dataSent = 0;
+    int32_t dataReceived = 0;
+    char buffer[4096];
 
     UDPQuality() = default;
     ~UDPQuality() noexcept
     {
-        if (use_rpp_socket())
-            socket.close();
-        else
-        {
-        #if _WIN32
-            closesocket(c_sock);
-        #else
-            close(c_sock)
-        #endif
-        }
+        if (use_rpp_socket()) socket.close();
+        else                  socket_udp_close(c_sock);
     }
 
     bool use_rpp_socket() const noexcept { return c_sock == -1; }
 
-    void sendDataPacket(const rpp::ipaddress& to, int32_t* packetsSent) noexcept
+    void sendDataPacket(const rpp::ipaddress& to) noexcept
     {
-        Packet pkt;
-        pkt.header.type = PacketType::DATA;
-        pkt.header.len = DATA_PACKET_SIZE;
-        pkt.header.seqid = *packetsSent;
-        memset(pkt.buffer, 'A', sizeof(pkt.buffer));
-        if (sendPacketTo(pkt, to))
-            ++(*packetsSent);
+        Data data;
+        data.type = PacketType::DATA;
+        data.seqid = dataSent;
+        memset(data.buffer, 'A', sizeof(data.buffer));
+        if (sendPacketTo(&data, sizeof(data), to))
+            ++dataSent;
     }
 
-    void sendStatusPacket(StatusType type, const rpp::ipaddress& to, int32_t packetsSent, int32_t packetsReceived) noexcept
+    bool sendStatusPacket(StatusType status, const rpp::ipaddress& to) noexcept
     {
-        Packet pkt;
-        pkt.header.type = PacketType::STATUS;
-        pkt.header.len = STATUS_PACKET_SIZE;
-        pkt.header.seqid = packetsSent;
-        pkt.status.type = type;
-        pkt.status.packetsSent = packetsSent;
-        pkt.status.packetsReceived = packetsReceived;
-        pkt.status.maxBytesPerSecond = balancer.get_max_bytes_per_sec();
-        sendPacketTo(pkt, to);
+        Status st;
+        st.type = PacketType::STATUS;
+        st.seqid = statusSeqId++;
+        st.status = status;
+        st.sender = whoami;
+        st.packetsSent = dataSent;
+        st.packetsReceived = dataReceived;
+        st.maxBytesPerSecond = balancer.get_max_bytes_per_sec();
+        printStatus("send", st);
+        return sendPacketTo(&st, sizeof(Status), to);
     }
 
-    bool sendPacketTo(const Packet& pkt, const rpp::ipaddress& to) noexcept
+    void printStatus(const char* recvOrSend, const Status& st) noexcept
+    {
+        LogInfo("   %s from %s STATUS %d %s:   sent:%d recv:%d", recvOrSend,
+                to_string(st.sender), st.seqid, to_string(st.status), st.packetsSent, st.packetsReceived);
+    }
+
+    bool sendPacketTo(const Packet* pkt, int pktlen, const rpp::ipaddress& to) noexcept
     {
         if (balancer.get_max_bytes_per_sec() != 0)
-            balancer.wait_to_send(pkt.header.len);
+            balancer.wait_to_send(pktlen);
 
-        if (use_rpp_socket())
-        {
-            if (socket.sendto(to, &pkt, pkt.header.len) <= 0)
-            {
-                LogError(RED("sendto %s %d failed: %s"), to.str(), pkt.header.len, socket.last_err());
-                return false;
-            }
-        }
-        else
-        {
-            struct sockaddr_in addr_to;
-            addr_to.sin_family = AF_INET;
-            addr_to.sin_port = htons(to.Port);
-            addr_to.sin_addr.s_addr = to.Address.Addr4;
-            memset(addr_to.sin_zero, 0, sizeof(addr_to.sin_zero));
-            int r = sendto(c_sock, (const char*)&pkt, pkt.header.len, 0, (struct sockaddr*)&addr_to, sizeof(addr_to));
-            if (r <= 0)
-            {
-                LogError(RED("sendto %s %d failed: %s"), to.str(), pkt.header.len, rpp::socket::last_os_socket_err());
-                return false;
-            }
+        int r = use_rpp_socket()
+              ? socket.sendto(to, pkt, pktlen)
+              : socket_sendto(c_sock, pkt, pktlen, to.Address.Addr4, to.Port);
+        if (r <= 0) {
+            LogError(RED("sendto %s %s len:%d failed: %s"), to.str(), to_string(pkt->type), pktlen, rpp::socket::last_os_socket_err());
+            return false;
         }
         return true;
     }
 
-    int recvPacketFrom(Packet* pkt, rpp::ipaddress& from, int timeoutMillis) noexcept
+    Status* recvStatusFrom(rpp::ipaddress& from, int timeoutMillis) noexcept
+    {
+        int received = recvPacketFrom(buffer, sizeof(buffer), from, timeoutMillis);
+        if (received == 0) {
+            LogError(RED("recv STATUS timeout"));
+            return nullptr;
+        }
+        if (received < 0) {
+            LogError(RED("recv STATUS failed: %s"), socket.last_err());
+            return nullptr;
+        }
+
+        Packet& packet = *reinterpret_cast<Packet*>(buffer);
+        if (packet.type != PacketType::STATUS) {
+            LogError(RED("recv STATUS invalid packet.type:%d from: %s"), packet.type, socket.last_err());
+            return nullptr;
+        }
+        Status* st = reinterpret_cast<Status*>(buffer);
+        printStatus("recv", *st);
+        return st;
+    }
+
+    int recvPacketFrom(char* buffer, int maxlen, rpp::ipaddress& from, int timeoutMillis) noexcept
     {
         if (timeoutMillis > 0)
         {
-            if (use_rpp_socket())
-            {
-                if (!socket.poll(timeoutMillis))
-                    return 0; // no data available (timeout)
-            }
-            else
-            {
-                struct pollfd pfd;
-                pfd.fd = c_sock;
-                pfd.events = POLLIN;
-                pfd.revents = 0;
-                #if _WIN32 || _WIN64
-                    int r = WSAPoll(&pfd, 1, timeoutMillis);
-                #else
-                    int r = ::poll(&pfd, 1, timeoutMillis);
-                #endif
-                if (r <= 0 || (pfd.revents & POLLIN) == 0)
-                    return 0; // no data available (timeout)
-            }
+            bool canRead = use_rpp_socket()
+                         ? socket.poll(timeoutMillis, rpp::socket::PF_Read)
+                         : socket_poll_recv(c_sock, timeoutMillis);
+            if (!canRead)
+                return 0; // no data available (timeout)
         }
-
-        int n;
-        if (use_rpp_socket())
-        {
-            n = socket.recvfrom(from, pkt, sizeof(*pkt));
-            if (n <= 0)
-            {
-                LogError("recvfrom failed: %s", socket.last_err());
-            }
-        }
-        else
-        {
-            struct sockaddr_in addr_from;
-            socklen_t len = sizeof(addr_from);
-            n = recvfrom(c_sock, (char*)pkt, sizeof(*pkt), 0, (struct sockaddr*)&addr_from, &len);
-            if (n <= 0)
-            {
-                LogError("recvfrom failed: %s", rpp::socket::last_os_socket_err());
-            }
-            else
-            {
-                from.Address.Family = rpp::AF_IPv4;
-                from.Address.Addr4 = addr_from.sin_addr.s_addr;
-                from.Port = ntohs(addr_from.sin_port);
-            }
-        }
+        int n = use_rpp_socket()
+              ? socket.recvfrom(from, buffer, maxlen)
+              : socket_recvfrom(c_sock, buffer, maxlen, &from.Address.Addr4, &from.Port);
+        if (n <= 0) LogError("recvfrom failed: %s", rpp::socket::last_os_socket_err());
+        if (n > 0) from.Address.Family = rpp::AF_IPv4;
         return n;
+    }
+
+    int getBufSize(rpp::socket::buffer_option buf) const noexcept
+    {
+        if (use_rpp_socket()) return socket.get_buf_size(buf);
+        else                  return socket_get_buf_size(c_sock, (buf == rpp::socket::BO_Recv ? SO_RCVBUF : SO_SNDBUF));
     }
 
     bool setBufSize(rpp::socket::buffer_option buf, int bufSize) noexcept
@@ -236,213 +275,204 @@ struct UDPQuality
         }
         else
         {
-            int command = (buf == rpp::socket::BO_Recv ? SO_RCVBUF : SO_SNDBUF);
-        #if __linux__
-            // NOTE: on linux the kernel doubles buffsize for internal bookkeeping
-            //       so to keep things consistent between platforms, we divide by 2 on linux:
-            int size_cmd = static_cast<int>(bufSize / 2);
-            int force_command = (opt == BO_Recv ? SO_RCVBUFFORCE : SO_SNDBUFFORCE);
-        #else
-            int size_cmd = static_cast<int>(bufSize);
-            int force_command = 0;
-        #endif
-            bool ok = setsockopt(c_sock, SOL_SOCKET, command, (char*)&size_cmd, sizeof(int)) == 0;
-            if (!ok && force_command != 0)
-                setsockopt(c_sock, SOL_SOCKET, force_command, (char*)&size_cmd, sizeof(int));
-            socklen_t len = sizeof(int);
-            getsockopt(c_sock, SOL_SOCKET, command, (char*)&finalSize, &len);
+            int so_buf = (buf == rpp::socket::BO_Recv ? SO_RCVBUF : SO_SNDBUF);
+            socket_set_buf_size(c_sock, so_buf, bufSize);
+            finalSize = socket_get_buf_size(c_sock, so_buf);
         }
 
         if (finalSize == bufSize)
-        {
             LogInfo(GREEN("set %s to %s SUCCEEDED"), name, toLiteral(bufSize));
-            return true;
-        }
         else
-        {
             LogError(RED("set %s to %s failed (remains %d): %s"),
                     name, toLiteral(bufSize), toLiteral(finalSize), rpp::socket::last_os_socket_err());
-            return false;
-        }
+        return finalSize == bufSize;
     }
 
-    void setSocketBufSize(int32_t bufSize)
+    std::string rateString(int bytesPerSec) const noexcept
     {
-        if (socketBufSize == bufSize)
-            return;
-        socketBufSize = bufSize;
-        setBufSize(rpp::socket::BO_Recv, bufSize);
-        setBufSize(rpp::socket::BO_Send, bufSize);
+        return bytesPerSec > 0 ? toLiteral(bytesPerSec) + "/s" : "unlimited B/s";
     }
 
-    void client(int32_t bytesPerSec, const rpp::ipaddress& serverAddr) noexcept
+    void client() noexcept
     {
-        int32_t packetsSent = 0;
-        int32_t packetsReceived = 0;
-        int32_t burstWriteCount = bytesPerSec / DATA_PACKET_SIZE;
+        whoami = SenderType::CLIENT;
+        int32_t burstWriteCount = args.bytesPerBurst / DATA_PACKET_SIZE;
         const int iterations = 5;
+        char buffer[4096];
 
-        // initialize test with [0,0]
-        LogInfo("Sending handshake to %s", serverAddr.str());
-        sendStatusPacket(StatusType::INIT, serverAddr, 0, 0);
+        if (!sendStatusPacket(StatusType::INIT, args.serverAddr))
+            LogErrorExit(RED("Failed to send INIT packet"));
 
         // and wait for response
         rpp::ipaddress actualServer;
-        Packet pkt;
-        int initResponse = recvPacketFrom(&pkt, actualServer, /*timeoutMillis*/2000);
-        if (initResponse == 0) LogErrorExit(RED("Handshake failed (timeout)"));
-        if (initResponse < 0) LogErrorExit(RED("Handshake failed: %s"), socket.last_err());
-
-        if (pkt.status.type != StatusType::INIT)
-            LogErrorExit(RED("Invalid handshake (%d) from: %s"), pkt.status.type, socket.last_err());
-
-        LogInfo("Received handshake from server: %s", actualServer.str());
+        if (Status* st = recvStatusFrom(actualServer, /*timeoutMillis*/2000))
+        {
+            if (st->status != StatusType::INIT)
+                LogErrorExit(RED("Handshake failed"));
+            LogInfo(GREEN("Received HANDSHAKE: %s"), actualServer.str());
+        }
+        else LogErrorExit(RED("Handshake failed"));
 
         // only run a limited number of times
         for (int i = 0; i < iterations; ++i)
         {
             // send data burst
-            LogInfo(BLUE("Burst writing %d packets, total %s/s"), burstWriteCount, toLiteral(bytesPerSec));
-            for (int j = 0; j < burstWriteCount; ++j)
-            {
-                sendDataPacket(actualServer, &packetsSent);
+            int32_t totalSize = DATA_PACKET_SIZE * burstWriteCount;
+            LogInfo(MAGENTA(">> SEND BURST pkts:%d  size:%s  rate:%s"), 
+                    burstWriteCount, toLiteral(totalSize), rateString(args.bytesPerSec));
+
+            rpp::Timer dataStart { rpp::Timer::AutoStart };
+            for (int j = 0; j < burstWriteCount; ++j) {
+                sendDataPacket(actualServer);
             }
+            double dataElapsedMs = dataStart.elapsed_ms();
+            double actualBytesPerSec = totalSize / (dataElapsedMs / 1000.0);
+            LogInfo(MAGENTA(">> SEND ELAPSED %.2fms  actualrate:%s"), dataElapsedMs, rateString(int(actualBytesPerSec)));
 
-            // send status
-            LogInfo(BLUE("Send STATUS to server: %d sent, %d received"), packetsSent, packetsReceived);
-            sendStatusPacket(StatusType::RUNNING, actualServer, packetsSent, packetsReceived);
+            // after sending the packets, send the status
+            if (!sendStatusPacket(StatusType::RUNNING, actualServer))
+                LogErrorExit(RED("Failed to send STATUS packet"));
 
-            // receive echoed packets UNTIL we receive a status packet or until we time out
-            rpp::Timer start;
-            PacketRange range = { 0, { 0 } };
-
-            LogInfo(BLUE("Waiting until STATUS response from server"));
-            int statusResponse = recvPacketFrom(&pkt, actualServer, /*timeoutMillis*/2000);
-            if (statusResponse <= 0)
-                LogInfo(RED("Timeout waiting for server STATUS response. Our STATUS didn't arrive to server?"));
+            // now collect all the data packets until we encounter a STATUS packet
+            rpp::Timer start { rpp::Timer::AutoStart };
+            range.reset();
 
             while (true)
             {
-                uint32_t elapsed_ms = start.elapsed_ms();
-                if (elapsed_ms >= 5000)
-                {
-                    LogInfo(RED("Timeout waiting for server STATUS response. Our STATUS didn't arrive to server?"));
+                if (start.elapsed_ms() >= 2000) {
+                    LogInfo(RED("Timeout waiting data from SERVER. Our STATUS didn't arrive to server?"));
                     range.printErrors();
                     break;
                 }
 
-                int r = recvPacketFrom(&pkt, actualServer, /*timeoutMillis*/50);
-                if (r == 0)
-                    continue; // no data available, continue waiting
-
-                if (r < 0)
-                {
+                int r = recvPacketFrom(buffer, sizeof(buffer), actualServer, /*timeoutMillis*/100);
+                if (r == 0) continue; // no data available, continue waiting
+                if (r < 0) {
                     range.printErrors();
                     break; // error
                 }
 
-                if (pkt.header.type == PacketType::DATA)
+                start.start(); // restart the timer
+                Packet& pkt = *reinterpret_cast<Packet*>(buffer);
+                if (pkt.type == PacketType::DATA)
                 {
-                    ++packetsReceived;
-                    range.push(pkt.header.seqid);
+                    ++dataReceived;
+                    range.push(pkt.seqid);
                 }
-                else if (pkt.header.type == PacketType::STATUS)
+                else if (pkt.type == PacketType::STATUS)
                 {
+                    Status& st = *reinterpret_cast<Status*>(buffer);
+                    printStatus("recv", st);
                     range.printErrors();
-                    LogInfo("=============================================");
-                    LogInfo("Server STATUS:   %d received", pkt.status.packetsReceived);
-                    LogInfo("Client STATUS:   %d sent, %d received back", packetsSent, packetsReceived);
-                    if (packetsSent != packetsReceived)
-                        LogInfo(ORANGE("Client DIDNT RECEIVE BACK %d packets"), packetsSent - packetsReceived);
-
-                    float sent_rate = 100.0f * (float(packetsReceived) / packetsSent);
-                    float loss_rate = 100.0f - sent_rate;
-                    if      (sent_rate > 99.99f) LogInfo(GREEN( "Client SENT:     %.2f%%"), sent_rate);
-                    else if (sent_rate > 90.0f)  LogInfo(ORANGE("Client SENT:     %.2f%%"), sent_rate);
-                    else                         LogInfo(RED(   "Client SENT:     %.2f%%"), sent_rate);
-                    if      (loss_rate < 0.01f)  LogInfo(GREEN( "Client LOSS:     %.2f%%"), loss_rate);
-                    else if (loss_rate < 10.0f)  LogInfo(ORANGE("Client LOSS:     %.2f%%"), loss_rate);
-                    else                         LogInfo(RED(   "Client LOSS:     %.2f%%"), loss_rate);
-                    LogInfo("=============================================\n");
-                    break; // GOT STATUS, write next batch
+                    if (dataSent != dataReceived)
+                        LogInfo(ORANGE("Client DIDNT RECEIVE BACK %d packets"), dataSent - dataReceived);
+                    break; // GOT STATUS, we're done
                 }
             }
         }
 
-        sendStatusPacket(StatusType::FINISHED, actualServer, packetsSent, packetsReceived);
+        sendStatusPacket(StatusType::FINISHED, actualServer);
         rpp::sleep_ms(1000); // wait for all packets to be sent
+        printSummary();
+    }
+
+    void printSummary()
+    {
+        float sent_rate = 100.0f * (float(dataReceived) / dataSent);
+        float loss_rate = 100.0f - sent_rate;
+        if      (sent_rate > 99.99f) LogInfo(GREEN( "Client SENT:     %.2f%%"), sent_rate);
+        else if (sent_rate > 90.0f)  LogInfo(ORANGE("Client SENT:     %.2f%%"), sent_rate);
+        else                         LogInfo(RED(   "Client SENT:     %.2f%%"), sent_rate);
+        if      (loss_rate < 0.01f)  LogInfo(GREEN( "Client LOSS:     %.2f%%"), loss_rate);
+        else if (loss_rate < 10.0f)  LogInfo(ORANGE("Client LOSS:     %.2f%%"), loss_rate);
+        else                         LogInfo(RED(   "Client LOSS:     %.2f%%"), loss_rate);
+        LogInfo("=============================================\n");
     }
 
     void server()
     {
-        int packetsReceived = 0; // server packetsSent always equals packetsReceived
-        PacketRange range = { 0, { 0 } };
+        whoami = SenderType::SERVER;
         rpp::ipaddress clientAddr;
+        range.reset();
+        char buffer[4096];
 
         while (true) // receive packets infinitely
         {
-            Packet pkt;
-            int32_t numReceived = recvPacketFrom(&pkt, clientAddr, /*timeoutMillis*/50);
-            if (numReceived <= 0)
+            int32_t recvlen = recvPacketFrom(buffer, sizeof(buffer), clientAddr, /*timeoutMillis*/100);
+            if (recvlen <= 0)
                 continue;
 
-            if (pkt.header.len == 0)
+            Packet* packet = reinterpret_cast<Packet*>(buffer);
+
+            if ((packet->type != PacketType::DATA && packet->type != PacketType::STATUS) ||
+                (packet->type == PacketType::DATA && recvlen != DATA_PACKET_SIZE) ||
+                (packet->type == PacketType::STATUS && recvlen != STATUS_PACKET_SIZE))
             {
-                LogInfo(ORANGE("Received empty packet (size=%d) from %s: type=%d len=%d seqid=%d"),
-                        numReceived, clientAddr.str(), int(pkt.header.type), pkt.header.len, pkt.header.seqid);
+                LogInfo(ORANGE("recv invalid packet (size=%d) from %s: type=%d seqid=%d"),
+                        recvlen, clientAddr.str(), int(packet->type), packet->seqid);
                 continue;
             }
 
-            if (pkt.header.type == PacketType::DATA)
+            if (packet->type == PacketType::DATA)
             {
-                ++packetsReceived;
-                range.push(pkt.header.seqid);
-                sendPacketTo(pkt, clientAddr); // echo back the packet
+                ++dataReceived;
+                range.push(packet->seqid);
+                if (sendPacketTo(packet, recvlen, clientAddr))
+                    ++dataSent;
+                else
+                    LogInfo(ORANGE("Failed to echo packet: %d"), packet->seqid);
             }
-            else if (pkt.header.type == PacketType::STATUS)
+            else if (packet->type == PacketType::STATUS)
             {
+                Status& st = *reinterpret_cast<Status*>(buffer);
                 // Client is initializing a new session
-                if (pkt.status.type == StatusType::INIT)
+                if (st.status == StatusType::INIT)
                 {
-                    LogInfo("\x1b[0m=============================================");
-                    std::string rate = pkt.status.maxBytesPerSecond > 0
-                                     ? toLiteral(pkt.status.maxBytesPerSecond) + "/s"
-                                     : "unlimited B/s";
-                    LogInfo("Client STARTED: %s  rate:%s  buf:%s\n", clientAddr.str(), rate, toLiteral(socketBufSize));
-                    packetsReceived = 0;
-                    balancer.set_max_bytes_per_sec(pkt.status.maxBytesPerSecond);
+                    LogInfo("\x1b[0m===================================================");
+                    dataReceived = 0;
+                    dataSent = 0;
+                    statusSeqId = 0;
+
+                    printStatus("recv", st);
+                    sendStatusPacket(StatusType::INIT, clientAddr); // echo back the init handshake
+
+                    std::string rate = st.maxBytesPerSecond > 0 ? toLiteral(st.maxBytesPerSecond) + "/s" : "unlimited B/s";
+                    LogInfo("   STARTED %d: %s  rate:%s  rcvbuf:%s  sndbuf:%s", 
+                            st.seqid, clientAddr.str(), rate, 
+                            toLiteral(getBufSize(rpp::socket::BO_Recv)),
+                            toLiteral(getBufSize(rpp::socket::BO_Send)));
+                    balancer.set_max_bytes_per_sec(st.maxBytesPerSecond);
                     range.reset();
-                    sendStatusPacket(StatusType::INIT, clientAddr, 0, 0); // echo back the init handshake
                 }
-                else if (pkt.status.type == StatusType::FINISHED)
+                else if (st.status == StatusType::FINISHED)
                 {
-                    LogInfo("=============================================");
-                    LogInfo("Client FINISHED: %s", clientAddr.str());
-                    LogInfo("Client STATUS:   %d sent, %d received", pkt.status.packetsSent, pkt.status.packetsReceived);
-                    float sent_rate = 100.0f * (float(pkt.status.packetsReceived) / pkt.status.packetsSent);
+                    LogInfo("|-------------------------------------------------|");
+                    printStatus("recv", st);
+                    sendStatusPacket(StatusType::FINISHED, clientAddr); // echo back the finished handshake
+                    float sent_rate = 100.0f * (float(st.packetsReceived) / st.packetsSent);
                     float loss_rate = 100.0f - sent_rate;
-                    if      (sent_rate > 99.99f) LogInfo(GREEN( "Client SENT:     %.2f%%"), sent_rate);
-                    else if (sent_rate > 90.0f)  LogInfo(ORANGE("Client SENT:     %.2f%%"), sent_rate);
-                    else                         LogInfo(RED(   "Client SENT:     %.2f%%"), sent_rate);
-                    if      (loss_rate < 0.01f)  LogInfo(GREEN( "Client LOSS:     %.2f%%"), loss_rate);
-                    else if (loss_rate < 10.0f)  LogInfo(ORANGE("Client LOSS:     %.2f%%"), loss_rate);
-                    else                         LogInfo(RED(   "Client LOSS:     %.2f%%"), loss_rate);
-                    LogInfo("=============================================");
+                    if      (sent_rate > 99.99f) LogInfo(GREEN( "   Client SENT:     %.2f%%"), sent_rate);
+                    else if (sent_rate > 90.0f)  LogInfo(ORANGE("   Client SENT:     %.2f%%"), sent_rate);
+                    else                         LogInfo(RED(   "   Client SENT:     %.2f%%"), sent_rate);
+                    if      (loss_rate < 0.01f)  LogInfo(GREEN( "   Client LOSS:     %.2f%%"), loss_rate);
+                    else if (loss_rate < 10.0f)  LogInfo(ORANGE("   Client LOSS:     %.2f%%"), loss_rate);
+                    else                         LogInfo(RED(   "   Client LOSS:     %.2f%%"), loss_rate);
+                    LogInfo("===================================================");
                     LogInfo("");
                     range.printErrors();
                     range.reset();
-                    sendStatusPacket(StatusType::FINISHED, clientAddr, 0, 0); // echo back the finished handshake
                 }
-                else
+                else if (st.status == StatusType::RUNNING)
                 {
+                    LogInfo("|-------------------------------------------------|");
+                    printStatus("recv", st);
+                    sendStatusPacket(StatusType::RUNNING, clientAddr); // echo back status
                     range.printErrors();
                     range.reset();
-                    LogInfo("=============================================");
-                    LogInfo("Client STATUS:   %d sent, %d received", pkt.status.packetsSent, pkt.status.packetsReceived);
-                    LogInfo("Server STATUS:   %d received & echoed", packetsReceived);
-                    if (pkt.status.packetsSent != packetsReceived)
-                        LogInfo(ORANGE("Server DIDNT RECEIVE %d packets"), pkt.status.packetsSent - packetsReceived);
-                    sendStatusPacket(StatusType::RUNNING, clientAddr, packetsReceived, packetsReceived); // echo back status
+                    if (st.packetsSent != dataReceived)
+                        LogInfo(ORANGE("   Server DIDNT RECEIVE %d packets"), st.packetsSent - dataReceived);
+                    if (dataSent != dataReceived)
+                        LogInfo(ORANGE("   Server DIDNT ECHO %d packets"), dataReceived - dataSent);
                 }
             }
         }
@@ -452,106 +482,59 @@ struct UDPQuality
 
 int main(int argc, char *argv[])
 {
-    for (int i = 1; i < argc; ++i)
-    {
+    auto next_arg = [=](int* i) -> rpp::strview {
+        if (++(*i) >= argc) printHelp(1);
+        return argv[*i];
+    };
+    for (int i = 1; i < argc; ++i) {
         rpp::strview arg = argv[i];
-        if (arg.equals("--listen"))
-        {
-            if (++i >= argc) printHelp(1);
-            args.listenerAddr = rpp::ipaddress4(atoi(argv[i]));
-        }
-        else if (arg.equals("--address"))
-        {
-            if (++i >= argc) printHelp(1);
-            args.serverAddr = rpp::ipaddress4(argv[i]);
-        }
-        else if (arg.equals("--rate"))
-        {
-            if (++i >= argc) printHelp(1);
-            args.bytesPerSec = parseBytes(argv[i]);
-        }
-        else if (arg.equals("--buf"))
-        {
-            if (++i >= argc) printHelp(1);
-            args.bufSize = parseBytes(argv[i]);
-        }
+        if      (arg == "--listen")  args.listenerAddr = rpp::ipaddress4(next_arg(&i).to_int());
+        else if (arg == "--address") args.serverAddr   = rpp::ipaddress4(next_arg(&i));
+        else if (arg == "--size")    args.bytesPerBurst = parseSizeLiteral(next_arg(&i));
+        else if (arg == "--rate")    args.bytesPerSec  = parseSizeLiteral(next_arg(&i));
+        else if (arg == "--buf")     args.rcvBufSize = args.sndBufSize = parseSizeLiteral(next_arg(&i));
+        else if (arg == "--rcvbuf")  args.rcvBufSize = parseSizeLiteral(next_arg(&i));
+        else if (arg == "--sndbuf")  args.sndBufSize = parseSizeLiteral(next_arg(&i));
         else if (arg == "--blocking")    args.blocking = true;
         else if (arg == "--nonblocking") args.blocking = false;
-        else if (arg.equals("--udpc")) args.udpc = true;
-        else if (arg.equals("--help")) printHelp(0);
-        else                           printHelp(1);
+        else if (arg == "--udpc")        args.udpc = true;
+        else if (arg == "--help") printHelp(0);
+        else                      printHelp(1);
     }
 
     UDPQuality udp;
 
     bool is_server = !args.listenerAddr.is_empty();
-    if (is_server && !args.listenerAddr.is_valid())
-    {
+    if (is_server && !args.listenerAddr.is_valid()) {
         LogError("invalid listen port %d", args.listenerAddr.port());
         printHelp(1);
-    }
-    else if (!is_server && !args.serverAddr.is_valid())
-    {
+    } else if (!is_server && !args.serverAddr.is_valid()) {
         LogError("Invalid server IP and port: '%s'", args.serverAddr.str());
         printHelp(1);
     }
 
-    if (!args.udpc)
-    {
+    if (!args.udpc) {
         auto option = (args.blocking ? rpp::SO_Blocking : rpp::SO_NonBlock);
         if (!udp.socket.create(rpp::AF_IPv4, rpp::IPP_UDP, option))
             LogErrorExit("Error creating a socket");
-
         if (is_server && !udp.socket.bind(args.listenerAddr)) 
             LogErrorExit("server bind port=%d failed", args.listenerAddr.port());
-    }
-    else
-    {
-        #if _WIN32
-            WSADATA w; WSAStartup(MAKEWORD(2, 2), &w);
-        #endif
-
+    } else {
         udp.c_sock = socket_udp_create();
-        if (udp.c_sock < 1) LogErrorExit("Error creating a socket");
-
-        if (is_server)
-        {
-            std::string port = std::to_string(args.listenerAddr.port());
-            if (socket_udp_bind(udp.c_sock, NULL, port.c_str()) != 0)
-                LogErrorExit("server bind port=%s failed", port);
-        }
-        else
-        {
-            std::string ip = args.serverAddr.address().str();
-            std::string port = std::to_string(args.serverAddr.port());
-            if (socket_udp_bind(udp.c_sock, ip.c_str(), port.c_str()) != 0)
-                LogErrorExit("client bind address=%s failed", port);
-        }
-
-    #if _WIN32
-        u_long val = args.blocking?0:1; // FIONBIO: !=0 nonblock, 0 block
-        if (ioctlsocket(udp.c_sock, FIONBIO, &val) != 0)
-            LogErrorExit("Error setting socket to nonblocking");
-    #else
-        int flags = fcntl(Sock, F_GETFL, 0);
-        if (flags < 0) flags = 0;
-        flags = args.blocking ? (flags & ~O_NONBLOCK) : (flags | O_NONBLOCK);
-        if (fcntl(Sock, F_SETFL, flags) != 0)
-            LogErrorExit("Error setting socket to nonblocking");
-    #endif
+        if (udp.c_sock < 1)
+            LogErrorExit("Error creating a socket");
+        if (is_server && socket_udp_listener(udp.c_sock, args.listenerAddr.port()) != 0)
+            LogErrorExit("server bind port=%d failed", args.listenerAddr.port());
+        socket_set_blocking(udp.c_sock, args.blocking);
     }
 
-    if (is_server)
-        LogInfo("\x1b[0mServer listening on port %d", args.listenerAddr.port());
-    else
-        LogInfo("\x1b[0mClient binding to server %s", args.serverAddr.str());
-
-    udp.setSocketBufSize(args.bufSize);
+    udp.setBufSize(rpp::socket::BO_Recv, args.rcvBufSize);
+    udp.setBufSize(rpp::socket::BO_Send, args.sndBufSize);
     udp.balancer.set_max_bytes_per_sec(args.bytesPerSec);
 
-    if (is_server)
-        udp.server();
-    else
-        udp.client(args.bytesPerSec, args.serverAddr);
+    if (is_server) LogInfo("\x1b[0mServer listening on port %d", args.listenerAddr.port());
+    else           LogInfo("\x1b[0mClient connecting to server %s", args.serverAddr.str());
+    if (is_server) udp.server();
+    else           udp.client();
     return 0;
 }

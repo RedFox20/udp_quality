@@ -12,7 +12,7 @@ set(CMAKE_CXX_EXTENSIONS ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON) # for clang-tidy
 find_package(Threads REQUIRED)
 
-add_executable(udp_quality udp_quality.cpp socket_udp.c)
+add_executable(udp_quality udp_quality.cpp simple_udp.cpp)
 target_link_libraries(udp_quality ${MAMA_LIBS} Threads::Threads)
 if(OCLEA)
     set(EXE_OUT bin/cv25)
