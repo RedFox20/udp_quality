@@ -38,17 +38,18 @@ static Args args;
 
 void printHelp(int exitCode) noexcept
 {
-    printf("Usage Client: ./udp_quality --address <ip:port> --size <burst_size> --rate <bytes_per_sec> --buf <socket_buf_size>\n");
+    printf("UDP Quality Tool v1.0 - (c) 2023 KrattWorks\n");
+    printf("Usage Client: ./udp_quality --client <ip:port> --size <burst_size> --rate <bytes_per_sec> --buf <socket_buf_size>\n");
     printf("Usage Server: ./udp_quality --listen <listen_port> --buf <socket_buf_size>\n");
-    printf("Usage Bridge: ./udp_quality --bridge <server:port> --buf <socket_buf_size>\n");
+    printf("Usage Bridge: ./udp_quality --bridge <listen_port> <to_ip> --buf <socket_buf_size>\n");
     printf("Details:\n");
     printf("    Client controls the main parameters of the test: --rate and --size\n");
     printf("    Server and Bridge only control their own socket buffer size: --buf\n");
     printf("    If Server and Bridge set their own --rate then it will override client\n");
     printf("Options:\n");
     printf("    --listen <listen_port>   Server listens on this port\n");
-    printf("    --address <ip:port>      Client connects to this server\n");
-    printf("    --bridge <server:port>   Client connects to this bridge packets are forwarded to server\n");
+    printf("    --client <ip:port>       Client connects to this server\n");
+    printf("    --bridge <listen_port> <to_ip> Bridge listens on port and forwards to_ip\n");
     printf("    --size <bytes_per_burst> Client sends this many bytes per burst [default 1MB]\n");
     printf("    --rate <bytes_per_sec>   Client/Server rate limits, use 0 to disable [default]\n");
     printf("    --buf <buf_size>         Socket SND/RCV buffer size [default 256KB]\n");
@@ -59,15 +60,10 @@ void printHelp(int exitCode) noexcept
     printf("    --noecho                 CLIENT: disables echo and only measures 1-way drop rate\n");
     printf("    --udpc                   Uses alternative UDP C socket implementation\n");
     printf("    --help\n");
-    printf("\n");
-    printf("When running from ubuntu, sudo is required\n");
-    printf("\n");
-    printf("    all rates can be expressed as a number followed by a unit:\n");
-    printf("        1000 = 1000 bytes\n");
-    printf("        1KB  = 1000 bytes \n");
-    printf("        1KiB = 1024 bytes\n");
-    printf("        1MB  = 1000 bytes \n");
-    printf("        1KiB = 1024 bytes\n");
+    printf("  When running from ubuntu, sudo is required\n");
+    printf("  All rates can be expressed as a number followed by a unit:\n");
+    printf("        1000 = 1000 bytes   1KB  = 1000 bytes   1MB  = 1000*1000 bytes\n");
+    printf("                            1KiB = 1024 bytes   1MiB = 1024*1024 bytes \n");
     exit(1);
 }
 
@@ -584,11 +580,35 @@ int main(int argc, char *argv[])
         if (++(*i) >= argc) printHelp(1);
         return argv[*i];
     };
+
+    bool is_server = false;
+    bool is_client = false;
+    bool is_bridge = false;
     for (int i = 1; i < argc; ++i) {
         rpp::strview arg = argv[i];
-        if      (arg == "--listen")  args.listenerAddr = rpp::ipaddress4(next_arg(&i).to_int());
-        else if (arg == "--address") args.serverAddr   = rpp::ipaddress4(next_arg(&i));
-        else if (arg == "--bridge")  args.bridgeForwardAddr = rpp::ipaddress4(next_arg(&i));
+        if (arg == "--listen" || arg == "--server") {
+            is_server = true;
+            args.listenerAddr = rpp::ipaddress4(next_arg(&i).to_int());
+            if (!args.listenerAddr.is_valid()) {
+                LogError("invalid listen port %d", args.listenerAddr.port());
+                printHelp(1);
+            }
+        } else if (arg == "--client" || arg == "--connect" || arg == "--address") {
+            is_client = true;
+            args.serverAddr = rpp::ipaddress4(next_arg(&i));
+            if (!args.serverAddr.is_valid()) {
+                LogError("invalid server <ip:port>: '%s'", args.serverAddr.str());
+                printHelp(1);
+            }
+        } else if (arg == "--bridge") {
+            is_bridge = true;
+            args.listenerAddr = rpp::ipaddress4(next_arg(&i).to_int());
+            args.bridgeForwardAddr = rpp::ipaddress4(next_arg(&i));
+            if (!args.listenerAddr.is_valid() || !args.bridgeForwardAddr.is_valid()) {
+                LogError("invalid bridge port %d to <ip:port>: '%s'", args.listenerAddr.port(), args.bridgeForwardAddr.str());
+                printHelp(1);
+            }
+        }
         else if (arg == "--size")    args.bytesPerBurst = parseSizeLiteral(next_arg(&i));
         else if (arg == "--rate")    args.bytesPerSec  = parseSizeLiteral(next_arg(&i));
         else if (arg == "--buf")     args.rcvBufSize = args.sndBufSize = parseSizeLiteral(next_arg(&i));
@@ -602,37 +622,23 @@ int main(int argc, char *argv[])
         else                      printHelp(1);
     }
 
-    UDPQuality udp;
-
-    bool is_server = !args.listenerAddr.is_empty();
-    bool is_client = !args.serverAddr.is_empty();
-    bool is_bridge = !args.bridgeForwardAddr.is_empty();
-
-    if (is_server && !args.listenerAddr.is_valid()) {
-        LogError("invalid listen port %d", args.listenerAddr.port());
-        printHelp(1);
-    } else if (is_client && !args.serverAddr.is_valid()) {
-        LogError("invalid server <ip:port>: '%s'", args.serverAddr.str());
-        printHelp(1);
-    } else if (is_bridge && !args.bridgeForwardAddr.is_valid()) {
-        LogError("invalid bridge <ip:port>: '%s'", args.bridgeForwardAddr.str());
-        printHelp(1);
-    } else {
+    int modes = (is_server + is_client + is_bridge);
+    if (modes == 0 || modes > 1) {
         printHelp(1);
     }
 
-
+    UDPQuality udp;
     if (!args.udpc) {
         auto option = (args.blocking ? rpp::SO_Blocking : rpp::SO_NonBlock);
         if (!udp.socket.create(rpp::AF_IPv4, rpp::IPP_UDP, option))
             LogErrorExit("Error creating a socket");
-        if (is_server && !udp.socket.bind(args.listenerAddr)) 
+        if ((is_server || is_bridge) && !udp.socket.bind(args.listenerAddr)) 
             LogErrorExit("server bind port=%d failed", args.listenerAddr.port());
     } else {
         udp.c_sock = socket_udp_create();
         if (udp.c_sock < 1)
             LogErrorExit("Error creating a socket");
-        if (is_server && socket_udp_listener(udp.c_sock, args.listenerAddr.port()) != 0)
+        if ((is_server || is_bridge) && socket_udp_listener(udp.c_sock, args.listenerAddr.port()) != 0)
             LogErrorExit("server bind port=%d failed", args.listenerAddr.port());
         socket_set_blocking(udp.c_sock, args.blocking);
     }
@@ -641,12 +647,17 @@ int main(int argc, char *argv[])
     udp.setBufSize(rpp::socket::BO_Send, args.sndBufSize);
     udp.balancer.set_max_bytes_per_sec(args.bytesPerSec);
 
-    if      (is_server) LogInfo("\x1b[0mServer listening on port %d", args.listenerAddr.port());
-    else if (is_client) LogInfo("\x1b[0mClient connecting to server %s", args.serverAddr.str());
-    else if (is_bridge) LogInfo("\x1b[0mBridging to serverr %s", args.bridgeForwardAddr.str());
-    if      (is_server) udp.server();
-    else if (is_client) udp.client();
-    else if (is_bridge) udp.bridge();
-    else                printHelp(1);
+    if (is_server) {
+        LogInfo("\x1b[0mServer listening on port %d", args.listenerAddr.port());
+        udp.server();
+    } else if (is_client) {
+        LogInfo("\x1b[0mClient connecting to server %s", args.serverAddr.str());
+        udp.client();
+    } else if (is_bridge) {
+        LogInfo("\x1b[0mBridging on port %d to server %s", args.listenerAddr.port(), args.bridgeForwardAddr.str());
+        udp.bridge();
+    } else {
+        printHelp(1);
+    }
     return 0;
 }
