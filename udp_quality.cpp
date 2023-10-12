@@ -28,6 +28,7 @@ struct Args
     int32_t bytesPerSec = 0;
     rpp::ipaddress4 listenerAddr;
     rpp::ipaddress serverAddr;
+    rpp::ipaddress bridgeForwardAddr;
     bool blocking = true;
     bool echo = true;
     bool udpc = false;
@@ -37,11 +38,17 @@ static Args args;
 
 void printHelp(int exitCode) noexcept
 {
+    printf("Usage Client: ./udp_quality --address <ip:port> --size <burst_size> --rate <bytes_per_sec> --buf <socket_buf_size>\n");
     printf("Usage Server: ./udp_quality --listen <listen_port> --buf <socket_buf_size>\n");
-    printf("Usage Client: ./udp_quality --address <ip:port> --rate <bytes_per_sec> --buf <socket_buf_size>\n");
+    printf("Usage Bridge: ./udp_quality --bridge <server:port> --buf <socket_buf_size>\n");
+    printf("Details:\n");
+    printf("    Client controls the main parameters of the test: --rate and --size\n");
+    printf("    Server and Bridge only control their own socket buffer size: --buf\n");
+    printf("    If Server and Bridge set their own --rate then it will override client\n");
     printf("Options:\n");
     printf("    --listen <listen_port>   Server listens on this port\n");
     printf("    --address <ip:port>      Client connects to this server\n");
+    printf("    --bridge <server:port>   Client connects to this bridge packets are forwarded to server\n");
     printf("    --size <bytes_per_burst> Client sends this many bytes per burst [default 1MB]\n");
     printf("    --rate <bytes_per_sec>   Client/Server rate limits, use 0 to disable [default]\n");
     printf("    --buf <buf_size>         Socket SND/RCV buffer size [default 256KB]\n");
@@ -83,6 +90,7 @@ enum class SenderType : int8_t
     UNKNOWN = 0,
     SERVER = 1,
     CLIENT = 2,
+    BRIDGE = 3,
 };
 
 static const char* to_string(PacketType type) noexcept
@@ -112,6 +120,7 @@ static const char* to_string(SenderType type) noexcept
     {
         case SenderType::SERVER: return "Server";
         case SenderType::CLIENT: return "Client";
+        case SenderType::BRIDGE: return "Bridge";
         default: return "UNKNOWN";
     }
 }
@@ -119,36 +128,31 @@ static const char* to_string(SenderType type) noexcept
 
 struct Packet
 {
-    PacketType type = PacketType::DATA; // DATA or STATUS?
-    uint8_t __reserved_p1;
-    uint8_t __reserved_p2;
-    uint8_t __reserved_p3;
+    // DATA or STATUS?
+    // if DATA, then additional data payload follows
+    PacketType type = PacketType::UNKNOWN;
+    StatusType status = StatusType::INIT;
+    SenderType sender = SenderType::UNKNOWN;
+    uint8_t echo = 0; // 0 or 1
     int32_t seqid = 0; // sequence id of this packet
-};
-
-struct Status : Packet
-{
-    StatusType status;
-    SenderType sender;
-    uint8_t echo; // 0 or 1
-    uint8_t __reserved_s1;
 
     // server: packets that we've echoed back
     // client: packets that we've initiated
-    int32_t packetsSent;
+    int32_t packetsSent = 0;
 
     // server: packets that we've received from the client
     // client: packets that we've received back as the echo reply
-    int32_t packetsReceived;
+    int32_t packetsReceived = 0;
 
     // sets the load balancer bytes per second limit
-    int32_t maxBytesPerSecond;
+    int32_t maxBytesPerSecond = 0;
 };
 
-static constexpr int STATUS_PACKET_SIZE = sizeof(Status);
+static constexpr int STATUS_PACKET_SIZE = sizeof(Packet);
 static constexpr int DATA_PACKET_SIZE = MTU_SIZE; // limit Header + Buffer to MTU size
 static constexpr int DATA_BUFFER_SIZE = (DATA_PACKET_SIZE - sizeof(Packet));
 
+// data packet with payload
 struct Data : Packet
 {
     char buffer[DATA_BUFFER_SIZE];
@@ -184,6 +188,9 @@ struct UDPQuality
     {
         Data data;
         data.type = PacketType::DATA;
+        data.status = StatusType::RUNNING;
+        data.sender = whoami;
+        data.echo = echo;
         data.seqid = dataSent;
         memset(data.buffer, 'A', sizeof(data.buffer));
         if (sendPacketTo(&data, sizeof(data), to))
@@ -192,20 +199,20 @@ struct UDPQuality
 
     bool sendStatusPacket(StatusType status, const rpp::ipaddress& to) noexcept
     {
-        Status st;
+        Packet st;
         st.type = PacketType::STATUS;
-        st.seqid = statusSeqId++;
         st.status = status;
         st.sender = whoami;
         st.echo = echo;
+        st.seqid = statusSeqId++;
         st.packetsSent = dataSent;
         st.packetsReceived = dataReceived;
         st.maxBytesPerSecond = balancer.get_max_bytes_per_sec();
         printStatus("send", st);
-        return sendPacketTo(&st, sizeof(Status), to);
+        return sendPacketTo(&st, sizeof(st), to);
     }
 
-    void printStatus(const char* recvOrSend, const Status& st) noexcept
+    void printStatus(const char* recvOrSend, const Packet& st) noexcept
     {
         LogInfo("   %s from %s STATUS %d %s:   sent:%d recv:%d", recvOrSend,
                 to_string(st.sender), st.seqid, to_string(st.status), st.packetsSent, st.packetsReceived);
@@ -226,7 +233,7 @@ struct UDPQuality
         return true;
     }
 
-    Status* recvStatusFrom(rpp::ipaddress& from, int timeoutMillis) noexcept
+    Packet* recvStatusFrom(rpp::ipaddress& from, int timeoutMillis) noexcept
     {
         int received = recvPacketFrom(buffer, sizeof(buffer), from, timeoutMillis);
         if (received == 0) {
@@ -238,14 +245,13 @@ struct UDPQuality
             return nullptr;
         }
 
-        Packet& packet = *reinterpret_cast<Packet*>(buffer);
-        if (packet.type != PacketType::STATUS) {
-            LogError(RED("recv STATUS invalid packet.type:%d from: %s"), int(packet.type), socket.last_err());
+        Packet* packet = reinterpret_cast<Packet*>(buffer);
+        if (packet->type != PacketType::STATUS) {
+            LogError(RED("recv STATUS invalid packet.type:%d from: %s"), int(packet->type), socket.last_err());
             return nullptr;
         }
-        Status* st = reinterpret_cast<Status*>(buffer);
-        printStatus("recv", *st);
-        return st;
+        printStatus("recv", *packet);
+        return packet;
     }
 
     int recvPacketFrom(char* buffer, int maxlen, rpp::ipaddress& from, int timeoutMillis) noexcept
@@ -309,14 +315,14 @@ struct UDPQuality
 
         int32_t burstWriteCount = args.bytesPerBurst / DATA_PACKET_SIZE;
         const int iterations = 5;
-        Status lastServerStatus; // last known status sent by Server
+        Packet lastServerStatus; // last known status sent by Server
 
         if (!sendStatusPacket(StatusType::INIT, args.serverAddr))
             LogErrorExit(RED("Failed to send INIT packet"));
 
         // and wait for response
         rpp::ipaddress actualServer;
-        if (Status* st = recvStatusFrom(actualServer, /*timeoutMillis*/2000))
+        if (Packet* st = recvStatusFrom(actualServer, /*timeoutMillis*/2000))
         {
             if (st->status != StatusType::INIT)
                 LogErrorExit(RED("Handshake failed"));
@@ -372,9 +378,9 @@ struct UDPQuality
                 }
                 else if (pkt.type == PacketType::STATUS)
                 {
-                    Status& st = *reinterpret_cast<Status*>(buffer);
-                    printStatus("recv", st);
-                    lastServerStatus = st;
+                    Packet& st = *reinterpret_cast<Packet*>(buffer);
+                    printStatus("recv", pkt);
+                    lastServerStatus = pkt;
 
                     if (echo) range.printErrors();
 
@@ -398,7 +404,7 @@ struct UDPQuality
         printClientSummary(lastServerStatus);
     }
 
-    void printClientSummary(Status& lastServerSt) noexcept
+    void printClientSummary(const Packet& lastServerSt) noexcept
     {
         // if echo is enabled, we count `dataReceived`, otherwise we count server `packetsReceived`
         int32_t received = echo ? dataReceived : lastServerSt.packetsReceived;
@@ -413,7 +419,7 @@ struct UDPQuality
         LogInfo("=============================================\n");
     }
 
-    void printServerSummary(Status& lastClientSt) noexcept
+    void printServerSummary(const Packet& lastClientSt) noexcept
     {
         // if echo is on, we use Client reported packetsReceived, otherwise we simply count what arrived in server
         int32_t received = echo ? lastClientSt.packetsReceived : dataReceived;
@@ -435,7 +441,6 @@ struct UDPQuality
         whoami = SenderType::SERVER;
         rpp::ipaddress clientAddr;
         range.reset();
-        char buffer[4096];
 
         while (true) // receive packets infinitely
         {
@@ -468,7 +473,7 @@ struct UDPQuality
             }
             else if (packet->type == PacketType::STATUS)
             {
-                Status& st = *reinterpret_cast<Status*>(buffer);
+                Packet& st = *reinterpret_cast<Packet*>(buffer);
                 // Client is initializing a new session
                 if (st.status == StatusType::INIT)
                 {
@@ -477,16 +482,17 @@ struct UDPQuality
                     dataSent = 0;
                     statusSeqId = 0;
                     echo = st.echo != 0;
+                    int32_t rateLimit = args.bytesPerSec > 0 ? args.bytesPerSec : st.maxBytesPerSecond;
 
                     printStatus("recv", st);
                     sendStatusPacket(StatusType::INIT, clientAddr); // echo back the init handshake
 
-                    std::string rate = st.maxBytesPerSecond > 0 ? toLiteral(st.maxBytesPerSecond) + "/s" : "unlimited B/s";
+                    std::string rate = rateLimit > 0 ? toLiteral(rateLimit) + "/s" : "unlimited B/s";
                     LogInfo("   STARTED %d: %s  rate:%s  rcvbuf:%s  sndbuf:%s", 
                             st.seqid, clientAddr.str(), rate, 
                             toLiteral(getBufSize(rpp::socket::BO_Recv)),
                             toLiteral(getBufSize(rpp::socket::BO_Send)));
-                    balancer.set_max_bytes_per_sec(st.maxBytesPerSecond);
+                    balancer.set_max_bytes_per_sec(rateLimit);
                     range.reset();
                 }
                 else if (st.status == StatusType::FINISHED)
@@ -511,8 +517,66 @@ struct UDPQuality
             }
         }
     }
-};
 
+    // bridge runs forever and simply forwards any packets to server
+    void bridge()
+    {
+        whoami = SenderType::BRIDGE;
+        rpp::ipaddress clientAddr;
+        rpp::ipaddress serverAddr = args.bridgeForwardAddr;
+        while (true)
+        {
+            rpp::ipaddress from;
+            int received = recvPacketFrom(buffer, sizeof(buffer), from, /*timeoutMillis*/100);
+            if (received <= 0)
+                continue;
+
+            Packet& packet = *reinterpret_cast<Packet*>(buffer);
+            if (packet.sender == SenderType::CLIENT)
+            {
+                clientAddr = from;
+            }
+
+            if (packet.type == PacketType::STATUS)
+            {
+                printStatus("recv", packet);
+
+                // client has sent init? then we need to reset our counters
+                if (packet.sender == SenderType::CLIENT)
+                {
+                    if (packet.status == StatusType::INIT)
+                    {
+                        dataReceived = 0;
+                        dataSent = 0;
+                        statusSeqId = 0;
+                        echo = packet.echo != 0;
+                    }
+                    else if (packet.status == StatusType::FINISHED)
+                    {
+                        printServerSummary(packet);
+                    }
+                }
+                range.printErrors();
+                range.reset();
+            }
+
+            if (packet.sender == SenderType::CLIENT)
+            {
+                ++dataReceived;
+                range.push(packet.seqid);
+                // forward the packet to the server
+                if (!sendPacketTo(&packet, received, serverAddr))
+                    LogError(ORANGE("Failed to forward packet: %d  %s"), packet.seqid, serverAddr.str());
+            }
+            else if (packet.sender == SenderType::SERVER)
+            {
+                // send packet to client
+                if (!sendPacketTo(&packet, received, clientAddr))
+                    LogError(ORANGE("send to client failed: %d  %s"), packet.seqid, clientAddr.str());
+            }
+        }
+    }
+};
 
 int main(int argc, char *argv[])
 {
@@ -524,6 +588,7 @@ int main(int argc, char *argv[])
         rpp::strview arg = argv[i];
         if      (arg == "--listen")  args.listenerAddr = rpp::ipaddress4(next_arg(&i).to_int());
         else if (arg == "--address") args.serverAddr   = rpp::ipaddress4(next_arg(&i));
+        else if (arg == "--bridge")  args.bridgeForwardAddr = rpp::ipaddress4(next_arg(&i));
         else if (arg == "--size")    args.bytesPerBurst = parseSizeLiteral(next_arg(&i));
         else if (arg == "--rate")    args.bytesPerSec  = parseSizeLiteral(next_arg(&i));
         else if (arg == "--buf")     args.rcvBufSize = args.sndBufSize = parseSizeLiteral(next_arg(&i));
@@ -540,13 +605,22 @@ int main(int argc, char *argv[])
     UDPQuality udp;
 
     bool is_server = !args.listenerAddr.is_empty();
+    bool is_client = !args.serverAddr.is_empty();
+    bool is_bridge = !args.bridgeForwardAddr.is_empty();
+
     if (is_server && !args.listenerAddr.is_valid()) {
         LogError("invalid listen port %d", args.listenerAddr.port());
         printHelp(1);
-    } else if (!is_server && !args.serverAddr.is_valid()) {
-        LogError("Invalid server IP and port: '%s'", args.serverAddr.str());
+    } else if (is_client && !args.serverAddr.is_valid()) {
+        LogError("invalid server <ip:port>: '%s'", args.serverAddr.str());
+        printHelp(1);
+    } else if (is_bridge && !args.bridgeForwardAddr.is_valid()) {
+        LogError("invalid bridge <ip:port>: '%s'", args.bridgeForwardAddr.str());
+        printHelp(1);
+    } else {
         printHelp(1);
     }
+
 
     if (!args.udpc) {
         auto option = (args.blocking ? rpp::SO_Blocking : rpp::SO_NonBlock);
@@ -567,9 +641,12 @@ int main(int argc, char *argv[])
     udp.setBufSize(rpp::socket::BO_Send, args.sndBufSize);
     udp.balancer.set_max_bytes_per_sec(args.bytesPerSec);
 
-    if (is_server) LogInfo("\x1b[0mServer listening on port %d", args.listenerAddr.port());
-    else           LogInfo("\x1b[0mClient connecting to server %s", args.serverAddr.str());
-    if (is_server) udp.server();
-    else           udp.client();
+    if      (is_server) LogInfo("\x1b[0mServer listening on port %d", args.listenerAddr.port());
+    else if (is_client) LogInfo("\x1b[0mClient connecting to server %s", args.serverAddr.str());
+    else if (is_bridge) LogInfo("\x1b[0mBridging to serverr %s", args.bridgeForwardAddr.str());
+    if      (is_server) udp.server();
+    else if (is_client) udp.client();
+    else if (is_bridge) udp.bridge();
+    else                printHelp(1);
     return 0;
 }
