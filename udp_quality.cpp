@@ -552,8 +552,8 @@ struct UDPQuality
                     {
                         printServerSummary(packet);
                     }
-                    range.printErrors();
-                    range.reset();
+                    // range.printErrors();
+                    // range.reset();
                 }
             }
 
