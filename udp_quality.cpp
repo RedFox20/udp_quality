@@ -120,9 +120,9 @@ static const char* to_string(SenderType type) noexcept
 struct Packet
 {
     PacketType type = PacketType::DATA; // DATA or STATUS?
-    uint8_t __reserved1;
-    uint8_t __reserved2;
-    uint8_t __reserved3;
+    uint8_t __reserved_p1;
+    uint8_t __reserved_p2;
+    uint8_t __reserved_p3;
     int32_t seqid = 0; // sequence id of this packet
 };
 
@@ -131,7 +131,7 @@ struct Status : Packet
     StatusType status;
     SenderType sender;
     uint8_t echo; // 0 or 1
-    uint8_t __reserved;
+    uint8_t __reserved_s1;
 
     // server: packets that we've echoed back
     // client: packets that we've initiated
