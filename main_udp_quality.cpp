@@ -14,8 +14,8 @@
 
 struct Args
 {
-    int32_t rcvBufSize = parseSizeLiteral("256KB");
-    int32_t sndBufSize = parseSizeLiteral("256KB");
+    int32_t rcvBufSize = 0;
+    int32_t sndBufSize = 0;
     int32_t bytesPerBurst = parseSizeLiteral("1MB");
     int32_t bytesPerSec = 0;
     int32_t count = 5;
@@ -50,9 +50,9 @@ void printHelp(int exitCode) noexcept
     printf("    --count <iterations>     Client/Server runs this many iterations [default 5]\n");
     printf("    --talkback <bytes>       Server sends this many bytes on its own [default 0]\n");
     printf("    --echo                   Server will also echo all recvd data packets [default false]\n");
-    printf("    --buf <buf_size>         Socket SND/RCV buffer size [default 256KB]\n");
-    printf("    --sndbuf <snd_buf_size>  Socket SND buffer size [default 256KB]\n");
-    printf("    --rcvbuf <rcv_buf_size>  Socket RCV buffer size [default 256KB]\n");
+    printf("    --buf <buf_size>         Socket SND/RCV buffer size [default: OS configured]\n");
+    printf("    --sndbuf <snd_buf_size>  Socket SND buffer size [default: OS configured]\n");
+    printf("    --rcvbuf <rcv_buf_size>  Socket RCV buffer size [default: OS configured]\n");
     printf("    --blocking               Uses blocking sockets [default]\n");
     printf("    --nonblocking            Uses nonblocking sockets\n");
     printf("    --udpc                   Uses alternative UDP C socket implementation\n");
@@ -522,9 +522,16 @@ int main(int argc, char *argv[])
     udp.c.create(args.blocking);
     if (args.is_server || args.is_bridge)
         udp.c.bind(args.listenerAddr.port());
-    udp.c.setBufSize(rpp::socket::BO_Recv, args.rcvBufSize);
-    udp.c.setBufSize(rpp::socket::BO_Send, args.sndBufSize);
+
     udp.c.balancer.set_max_bytes_per_sec(args.bytesPerSec);
+
+    if (args.rcvBufSize == 0)
+        LogInfo(CYAN("RCVBUF using OS default: %s"), toLiteral(udp.c.getBufSize(rpp::socket::BO_Recv)));
+    else udp.c.setBufSize(rpp::socket::BO_Recv, args.rcvBufSize);
+
+    if (args.sndBufSize == 0)
+        LogInfo(CYAN("SNDBUF using OS default: %s"), toLiteral(udp.c.getBufSize(rpp::socket::BO_Send)));
+    else udp.c.setBufSize(rpp::socket::BO_Send, args.sndBufSize);
 
     if (args.is_server) {
         LogInfo("\x1b[0mServer listening on port %d", args.listenerAddr.port());
