@@ -91,8 +91,9 @@ void socket_set_blocking(int socket, bool is_blocking) noexcept
 }
 
 
-void socket_set_buf_size(int socket, int so_buf, int buf_size) noexcept
+void socket_set_buf_size(int socket, bool rcv_buf, int buf_size) noexcept
 {
+    int so_buf = (rcv_buf ? SO_RCVBUF : SO_SNDBUF);
 #if __linux__
     // NOTE: on linux the kernel doubles buffsize for internal bookkeeping
     //       so to keep things consistent between platforms, we divide by 2 on linux:
@@ -107,8 +108,9 @@ void socket_set_buf_size(int socket, int so_buf, int buf_size) noexcept
         setsockopt(socket, SOL_SOCKET, so_buf_force, (char*)&size_cmd, sizeof(int));
 }
 
-int socket_get_buf_size(int socket, int so_buf) noexcept
+int socket_get_buf_size(int socket, bool rcv_buf) noexcept
 {
+    int so_buf = (rcv_buf ? SO_RCVBUF : SO_SNDBUF);
     int buf_size = 0;
     socklen_t len = sizeof(int);
     getsockopt(socket, SOL_SOCKET, so_buf, (char*)&buf_size, &len);

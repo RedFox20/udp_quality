@@ -10,8 +10,8 @@ void socket_udp_close(int socket) noexcept;
 void socket_set_blocking(int socket, bool is_blocking) noexcept;
 
 // so_buf: SO_RCVBUF or SO_SNDBUF
-void socket_set_buf_size(int socket, int so_buf, int buf_size) noexcept;
-int socket_get_buf_size(int socket, int so_buf) noexcept;
+void socket_set_buf_size(int socket, bool rcv_buf, int buf_size) noexcept;
+int socket_get_buf_size(int socket, bool rcv_buf) noexcept;
 
 int socket_sendto(int socket, const void* data, int size, 
                   uint32_t sin_addr, unsigned short port) noexcept;
