@@ -4,6 +4,7 @@
 // The client will simply collect back the Status packets from the server
 #include "udp_quality.h"
 #include "simple_udp.h" // for --udpc option
+#include <unordered_map>
 
 #if __linux__
     #include <sys/socket.h>
@@ -163,22 +164,54 @@ struct UDPQuality
     // rate limiter
     rpp::load_balancer balancer { uint32_t(8 * 1024 * 1024) };
 
-    PacketRange range{};
-    int32_t statusSeqId = 0;
+    int32_t statusSeqId = 0; // seqId for our status messages
     SenderType whoami = SenderType::SERVER;
-    int32_t dataSent = 0;
-    int32_t dataReceived = 0;
-    bool echo = true;
+    int32_t dataSent = 0; // data packets sent by us
+    int32_t dataReceived = 0; // data packets received by us
+    bool echo = true; // whether we should echo incoming packets back (SERVER only)
     char buffer[4096];
+
+    struct PacketInfo { int32_t count = 0; };
+
+    // all kinds of traffic statistics and state to find traffic bugs
+    struct TrafficStatus
+    {
+        SenderType sender = SenderType::UNKNOWN;
+        int32_t sentTo = 0; // data packets sent TO SENDER
+        int32_t recvFrom = 0; // data packets recvd FROM SENDER
+        int32_t lastReceivedSeqId = 0; // last received seqid from SENDER
+        int32_t outOfOrderPackets = 0; // SENDER sent X packets out of order
+        int32_t duplicatePackets = 0; // SENDER sent X duplicate packets
+        int32_t loopedPackets = 0; // SENDER saw its own data packets
+        std::unordered_map<int32_t, PacketInfo> packets;
+        PacketRange range;
+    };
+
+    TrafficStatus clientTr;
+    TrafficStatus serverTr;
+
+    void reset(bool useEcho, int32_t rateLimit) noexcept
+    {
+        statusSeqId = 0;
+        dataSent = 0;
+        dataReceived = 0;
+        echo = useEcho;
+        rateLimit = args.bytesPerSec > 0 ? args.bytesPerSec : rateLimit;
+        balancer.set_max_bytes_per_sec(rateLimit);
+
+        clientTr = { SenderType::CLIENT };
+        serverTr = { SenderType::SERVER };
+    }
 
     UDPQuality() = default;
     ~UDPQuality() noexcept
     {
-        if (use_rpp_socket()) socket.close();
-        else                  socket_udp_close(c_sock);
+        if (useRppSocket()) socket.close();
+        else                socket_udp_close(c_sock);
     }
 
-    bool use_rpp_socket() const noexcept { return c_sock == -1; }
+    int32_t getRateLimit() const noexcept { return balancer.get_max_bytes_per_sec(); }
+    bool useRppSocket() const noexcept { return c_sock == -1; }
 
     void sendDataPacket(const rpp::ipaddress& to) noexcept
     {
@@ -219,7 +252,7 @@ struct UDPQuality
         if (balancer.get_max_bytes_per_sec() != 0)
             balancer.wait_to_send(pktlen);
 
-        int r = use_rpp_socket()
+        int r = useRppSocket()
               ? socket.sendto(to, pkt, pktlen)
               : socket_sendto(c_sock, pkt, pktlen, to.Address.Addr4, to.Port);
         if (r <= 0) {
@@ -254,13 +287,13 @@ struct UDPQuality
     {
         if (timeoutMillis > 0)
         {
-            bool canRead = use_rpp_socket()
+            bool canRead = useRppSocket()
                          ? socket.poll(timeoutMillis, rpp::socket::PF_Read)
                          : socket_poll_recv(c_sock, timeoutMillis);
             if (!canRead)
                 return 0; // no data available (timeout)
         }
-        int n = use_rpp_socket()
+        int n = useRppSocket()
               ? socket.recvfrom(from, buffer, maxlen)
               : socket_recvfrom(c_sock, buffer, maxlen, &from.Address.Addr4, &from.Port);
         if (n <= 0) LogError("recvfrom failed: %s", rpp::socket::last_os_socket_err());
@@ -270,15 +303,15 @@ struct UDPQuality
 
     int getBufSize(rpp::socket::buffer_option buf) const noexcept
     {
-        if (use_rpp_socket()) return socket.get_buf_size(buf);
-        else                  return socket_get_buf_size(c_sock, (buf == rpp::socket::BO_Recv ? SO_RCVBUF : SO_SNDBUF));
+        if (useRppSocket()) return socket.get_buf_size(buf);
+        else                return socket_get_buf_size(c_sock, (buf == rpp::socket::BO_Recv ? SO_RCVBUF : SO_SNDBUF));
     }
 
     bool setBufSize(rpp::socket::buffer_option buf, int bufSize) noexcept
     {
         const char* name = (buf == rpp::socket::BO_Recv ? "RCVBUF" : "SNDBUF");
         int finalSize;
-        if (use_rpp_socket())
+        if (useRppSocket())
         {
             if (!socket.set_buf_size(buf, bufSize, /*force*/false))
                 socket.set_buf_size(buf, bufSize, /*force*/true);
@@ -299,9 +332,39 @@ struct UDPQuality
         return finalSize == bufSize;
     }
 
-    std::string rateString(int bytesPerSec) const noexcept
+    void onDataReceived(Packet& packet) noexcept
     {
-        return bytesPerSec > 0 ? toLiteral(bytesPerSec) + "/s" : "unlimited B/s";
+        if (packet.sender == SenderType::CLIENT)
+        {
+            TrafficStatus& tr = clientTr;
+            if (packet.seqid < tr.lastReceivedSeqId)
+                tr.outOfOrderPackets++;
+            tr.lastReceivedSeqId = packet.seqid;
+
+            PacketInfo& pktInfo = tr.packets[packet.seqid];
+            ++pktInfo.count;
+            if (pktInfo.count > 1)
+                tr.duplicatePackets++;
+
+            if (whoami == SenderType::SERVER)
+                tr..push(packet.seqid);
+        }
+        else if (packet.sender == SenderType::SERVER)
+        {
+            TrafficStatus& tr = serverTr;
+            if (packet.seqid != tr.lastReceivedSeqId)
+                tr.outOfOrderPackets++;
+            tr.lastReceivedSeqId = packet.seqid;
+
+            PacketInfo& pktInfo = serverPackets[packet.seqid];
+            ++pktInfo.count;
+            if (pktInfo.count > 1)
+                tr.duplicatePackets++;
+
+            if (whoami == SenderType::CLIENT)
+                tr.range.push(packet.seqid);
+        }
+
     }
 
     void client() noexcept
@@ -370,7 +433,7 @@ struct UDPQuality
                 if (pkt.type == PacketType::DATA)
                 {
                     ++dataReceived;
-                    range.push(pkt.seqid);
+                    onDataReceived(pkt);
                 }
                 else if (pkt.type == PacketType::STATUS)
                 {
@@ -400,41 +463,6 @@ struct UDPQuality
         printClientSummary(lastServerStatus);
     }
 
-    void printClientSummary(const Packet& lastServerSt) noexcept
-    {
-        // if echo is enabled, we count `dataReceived`, otherwise we count server `packetsReceived`
-        int32_t received = echo ? dataReceived : lastServerSt.packetsReceived;
-        float sentPercent = 100.0f * (float(received) / dataSent);
-        float lossPercent = 100.0f - sentPercent;
-        if      (sentPercent > 99.99f) LogInfo(GREEN( "Client SENT:     %.2f%%"), sentPercent);
-        else if (sentPercent > 90.0f)  LogInfo(ORANGE("Client SENT:     %.2f%%"), sentPercent);
-        else                           LogInfo(RED(   "Client SENT:     %.2f%%"), sentPercent);
-        if      (lossPercent < 0.01f)  LogInfo(GREEN( "Client LOSS:     %.2f%%"), lossPercent);
-        else if (lossPercent < 10.0f)  LogInfo(ORANGE("Client LOSS:     %.2f%%"), lossPercent);
-        else                           LogInfo(RED(   "Client LOSS:     %.2f%%"), lossPercent);
-        LogInfo("=============================================\n");
-    }
-
-    void printServerSummary(const Packet& lastClientSt) noexcept
-    {
-        // if echo is on, we use Client reported packetsReceived, otherwise we simply count what arrived in server
-        int32_t received = echo ? lastClientSt.packetsReceived : dataReceived;
-        float sentPercent = 100.0f * (float(received) / lastClientSt.packetsSent);
-        float lossPercent = 100.0f - sentPercent;
-        if      (sentPercent > 99.99f) LogInfo(GREEN( "   Client SENT:     %.2f%%"), sentPercent);
-        else if (sentPercent > 90.0f)  LogInfo(ORANGE("   Client SENT:     %.2f%%"), sentPercent);
-        else                           LogInfo(RED(   "   Client SENT:     %.2f%%"), sentPercent);
-        if      (lossPercent < 0.01f)  LogInfo(GREEN( "   Client LOSS:     %.2f%%"), lossPercent);
-        else if (lossPercent < 10.0f)  LogInfo(ORANGE("   Client LOSS:     %.2f%%"), lossPercent);
-        else                           LogInfo(RED(   "   Client LOSS:     %.2f%%"), lossPercent);
-        LogInfo("===================================================");
-        LogInfo("");
-        if (whoami == SenderType::SERVER)
-        {
-            range.printErrors();
-        }
-    }
-
     void server() noexcept
     {
         whoami = SenderType::SERVER;
@@ -461,9 +489,10 @@ struct UDPQuality
             if (packet->type == PacketType::DATA)
             {
                 ++dataReceived;
-                range.push(packet->seqid);
+                onDataReceived(*packet);
                 if (echo)
                 {
+                    packet->sender = SenderType::SERVER; // server echoing it now
                     if (sendPacketTo(packet, recvlen, clientAddr))
                         ++dataSent;
                     else
@@ -477,12 +506,7 @@ struct UDPQuality
                 if (st.status == StatusType::INIT)
                 {
                     LogInfo("\x1b[0m===================================================");
-                    dataReceived = 0;
-                    dataSent = 0;
-                    statusSeqId = 0;
-                    echo = st.echo != 0;
-                    int32_t rateLimit = args.bytesPerSec > 0 ? args.bytesPerSec : st.maxBytesPerSecond;
-
+                    reset(st.echo != 0, st.maxBytesPerSecond);
                     printStatus("recv", st);
                     sendStatusPacket(StatusType::INIT, clientAddr); // echo back the init handshake
 
@@ -491,23 +515,19 @@ struct UDPQuality
                             st.seqid, clientAddr.str(), rate, 
                             toLiteral(getBufSize(rpp::socket::BO_Recv)),
                             toLiteral(getBufSize(rpp::socket::BO_Send)));
-                    balancer.set_max_bytes_per_sec(rateLimit);
-                    range.reset();
                 }
                 else if (st.status == StatusType::FINISHED)
                 {
                     LogInfo("|-------------------------------------------------|");
                     printStatus("recv", st);
                     sendStatusPacket(StatusType::FINISHED, clientAddr); // echo back the finished handshake
-                    printServerSummary(st);
+                    printSummary(st);
                 }
                 else if (st.status == StatusType::RUNNING)
                 {
                     LogInfo("|-------------------------------------------------|");
                     printStatus("recv", st);
                     sendStatusPacket(StatusType::RUNNING, clientAddr); // echo back status
-                    range.printErrors();
-                    range.reset();
                     if (st.packetsSent != dataReceived)
                         LogInfo(ORANGE("   Server DIDNT RECEIVE %d packets"), st.packetsSent - dataReceived);
                     if (echo && dataSent != dataReceived)
@@ -531,11 +551,6 @@ struct UDPQuality
                 continue;
 
             Packet& packet = *reinterpret_cast<Packet*>(buffer);
-            if (packet.sender == SenderType::CLIENT)
-            {
-                clientAddr = from;
-            }
-
             if (packet.type == PacketType::STATUS)
             {
                 printStatus("recv", packet);
@@ -543,31 +558,28 @@ struct UDPQuality
                 // client has sent init? then we need to reset our counters
                 if (packet.sender == SenderType::CLIENT)
                 {
-                    LogInfo("   BRIDGE %s -> %s", from.str(), serverAddr.str());
                     if (packet.status == StatusType::INIT)
                     {
-                        dataReceived = 0;
-                        dataSent = 0;
-                        statusSeqId = 0;
-                        echo = packet.echo != 0;
+                        clientAddr = from;
+                        LogInfo("   BRIDGE init client=%s -> server=%s", clientAddr.str(), serverAddr.str());
+                        reset(false/*bridge does not echo*/, packet.maxBytesPerSecond);
                     }
                     else if (packet.status == StatusType::FINISHED)
                     {
-                        printServerSummary(packet);
+                        printSummary(packet);
                     }
-                    // range.printErrors();
-                    // range.reset();
                 }
             }
 
             if (packet.sender == SenderType::CLIENT)
             {
+                if (from != clientAddr)
+                    LogWarning("BRIDGE received packet from unknown client: %s", from.str());
                 if (packet.type == PacketType::DATA)
                 {
                     ++dataSent;
-                    range.push(packet.seqid);
+                    onDataReceived(packet);
                 }
-                // forward the packet to the server
                 if (!sendPacketTo(reinterpret_cast<Packet*>(buffer), received, serverAddr))
                     LogError(ORANGE("Failed to forward packet: %d  %s"), packet.seqid, serverAddr.str());
             }
@@ -576,13 +588,53 @@ struct UDPQuality
                 if (packet.type == PacketType::DATA)
                 {
                     ++dataReceived;
+                    onDataReceived(packet);
                 }
-                // send packet to client
                 if (!clientAddr.is_valid() || !sendPacketTo(reinterpret_cast<Packet*>(buffer), received, clientAddr))
                     LogError(ORANGE("send to client failed: %d  %s"), packet.seqid, clientAddr.str());
             }
         }
     }
+
+    void printSummary(const Packet& lastRemoteStatus) noexcept
+    {
+        int32_t received = 0;
+        int32_t sent = 1;
+        if (whoami == SenderType::CLIENT)
+        {
+            // if echo is enabled, we count `dataReceived`, otherwise we count server `packetsReceived`
+            received = echo ? dataReceived : lastServerSt.packetsReceived;
+            sent = std::max(dataSent, 1); // 1 to avoid division by zero
+        }
+        else if (whoami == SenderType::SERVER || whoami == SenderType::BRIDGE)
+        {
+            // if echo is on, we use Client reported packetsReceived, otherwise we simply count what arrived in server
+            received = echo ? lastRemoteStatus.packetsReceived : dataReceived;
+            sent = std::max(lastRemoteStatus.packetsSent, 1); // 1 to avoid division by zero
+        }
+
+        if (whoami == SenderType::CLIENT)
+        {
+            LogInfo("   BRIDGE forwarded %d packets to SERVER", dataSent);
+            LogInfo("   BRIDGE forwarded %d packets to CLIENT", dataReceived);
+        }
+
+        float sentPercent = 100.0f * (float(received) / sent);
+        float lossPercent = 100.0f - sentPercent;
+        if      (sentPercent > 99.99f) LogInfo(GREEN( "   Client SENT:     %.2f%%"), sentPercent);
+        else if (sentPercent > 90.0f)  LogInfo(ORANGE("   Client SENT:     %.2f%%"), sentPercent);
+        else                           LogInfo(RED(   "   Client SENT:     %.2f%%"), sentPercent);
+        if      (lossPercent < 0.01f)  LogInfo(GREEN( "   Client LOSS:     %.2f%%"), lossPercent);
+        else if (lossPercent < 10.0f)  LogInfo(ORANGE("   Client LOSS:     %.2f%%"), lossPercent);
+        else                           LogInfo(RED(   "   Client LOSS:     %.2f%%"), lossPercent);
+        LogInfo("===================================================\n");
+
+        if (whoami == SenderType::SERVER || whoami == SenderType::CLIENT)
+        {
+            range.printErrors();
+        }
+    }
+
 };
 
 int main(int argc, char *argv[])

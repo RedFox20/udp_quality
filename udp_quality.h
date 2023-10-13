@@ -30,6 +30,11 @@ static std::string toLiteral(uint32_t bytes) noexcept
     return buffer;
 }
 
+static std::string toRateLiteral(int bytesPerSec) const noexcept
+{
+    return bytesPerSec > 0 ? toLiteral(bytesPerSec) + "/s" : "unlimited B/s";
+}
+
 struct PacketRange
 {
     std::vector<int32_t> ids;
