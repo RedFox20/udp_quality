@@ -21,14 +21,8 @@ class udp_quality(mama.BuildTarget):
     def dependencies(self):
         self.add_git('ReCpp', 'https://github.com/RedFox20/ReCpp.git')
 
-
-    def configure(self):
-        pass
-
-
-    def build(self):
-        self.cmake_build()
-
+    def package(self):
+        self.export_libs('bin', ['udp_quality', 'udp_quality.exe'])
 
     def start(self, args):
         self.run_program(self.build_dir(), f'bin/udp_quality {args}')
