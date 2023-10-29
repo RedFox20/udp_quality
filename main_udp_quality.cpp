@@ -276,7 +276,8 @@ struct UDPQuality
                 waitAndRecvForDuration(minTalkbackMs);
             }
 
-            rpp::sleep_ms(100);
+            // wait at least 200ms which is ~2 beacon signals on MicroHard radios
+            rpp::sleep_ms(200);
             LogInfo(MAGENTA(">> SEND BURST FINISH recvd:%dpkts"), gotTalkback);
             // after we've waited enough, send BURST_FINISH
             if (!sendStatusPacket(StatusType::BURST_FINISH, actualServer))
@@ -292,7 +293,7 @@ struct UDPQuality
             ++statusIteration;
         }
 
-        rpp::sleep_ms(100); // wait a bit, send finish and wait for FINISHED status
+        rpp::sleep_ms(200); // wait a bit, send finish and wait for FINISHED status
         sendStatusPacket(StatusType::FINISHED, actualServer);
 
         if (toServer != actualServer)
