@@ -71,6 +71,9 @@ struct Packet
     uint8_t echo = 0; // 0 or 1
     int32_t seqid = 0; // sequence id of this packet
 
+    // length of this entire packet
+    int32_t len = 0;
+
     // # which iteration of the test this is
     int32_t iteration = 0;
 
@@ -88,14 +91,17 @@ struct Packet
 
     // sets the load balancer bytes per second limit
     int32_t maxBytesPerSecond = 0;
+
+    // sets the MTU size for the test
+    int32_t mtu = 0;
 };
 
-static constexpr int STATUS_PACKET_SIZE = sizeof(Packet);
-static constexpr int DATA_PACKET_SIZE = MTU_SIZE; // limit Header + Buffer to MTU size
-static constexpr int DATA_BUFFER_SIZE = (DATA_PACKET_SIZE - sizeof(Packet));
-
 // data packet with payload
+// the payload is allocated dynamically, check Packet::len to get the size
 struct Data : Packet
 {
-    char buffer[DATA_BUFFER_SIZE];
+    char buffer[];
+
+    int size() const noexcept { return size(this->len); }
+    int size(int pktsize) const noexcept { return pktsize - sizeof(Packet); }
 };

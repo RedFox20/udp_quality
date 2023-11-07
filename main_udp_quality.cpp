@@ -20,6 +20,7 @@ struct Args
     int32_t bytesPerSec = 0;
     int32_t count = 5;
     int32_t talkback = 0; // talkback packets to send back to server
+    int32_t mtu = 1450;
     rpp::ipaddress4 listenerAddr;
     rpp::ipaddress serverAddr;
     rpp::ipaddress bridgeForwardAddr;
@@ -50,6 +51,7 @@ void printHelp(int exitCode) noexcept
     printf("    --count <iterations>     Client/Server runs this many iterations [default 5]\n");
     printf("    --talkback <bytes>       Server sends this many bytes on its own [default 0]\n");
     printf("    --echo                   Server will also echo all recvd data packets [default false]\n");
+    printf("    --mtu <bytes>            Client Only: sets the MTU for the test [default 1450]\n");
     printf("    --buf <buf_size>         Socket SND/RCV buffer size [default: OS configured]\n");
     printf("    --sndbuf <snd_buf_size>  Socket SND buffer size [default: OS configured]\n");
     printf("    --rcvbuf <rcv_buf_size>  Socket RCV buffer size [default: OS configured]\n");
@@ -104,6 +106,7 @@ struct UDPQuality
 
     void reset(const Packet& clientInit) noexcept {
         args.echo = clientInit.echo != 0;
+        args.mtu = clientInit.mtu;
         burstCount = clientInit.burstCount;
         talkbackCount = clientInit.talkbackCount;
         statusSeqId = 0;
@@ -123,14 +126,16 @@ struct UDPQuality
     }
 
     void sendDataPacket(EndpointType toWhom, const rpp::ipaddress& toAddr) noexcept {
-        Data data;
-        data.type = PacketType::DATA;
-        data.status = StatusType::BURST_START;
-        data.sender = whoami;
-        data.echo = args.echo;
-        data.seqid = traffic(toWhom).sent;
-        memset(data.buffer, 'A', sizeof(data.buffer));
-        if (c.sendPacketTo(data, sizeof(data), toAddr))
+        auto buf = std::vector<uint8_t>(args.mtu, '\0');
+        Data* data = reinterpret_cast<Data*>(buf.data());
+        data->type = PacketType::DATA;
+        data->status = StatusType::BURST_START;
+        data->sender = whoami;
+        data->echo = args.echo;
+        data->seqid = traffic(toWhom).sent;
+        data->len = args.mtu;
+        memset(data->buffer, 'A', data->size(args.mtu));
+        if (c.sendPacketTo(*data, args.mtu, toAddr))
             traffic(toWhom).sent++;
     }
 
@@ -142,6 +147,7 @@ struct UDPQuality
 
         st.echo = args.echo;
         st.seqid = statusSeqId++;
+        st.len = sizeof(Packet);
         st.iteration = statusIteration;
         st.burstCount = burstCount;
         st.talkbackCount = talkbackCount;
@@ -149,6 +155,7 @@ struct UDPQuality
         st.dataSent = traffic(talkingTo).sent;
         st.dataReceived = traffic(talkingTo).received;
         st.maxBytesPerSecond = c.balancer.get_max_bytes_per_sec();
+        st.mtu = args.mtu;
         printStatus("send", st);
         return c.sendPacketTo(st, sizeof(st), to);
     }
@@ -200,9 +207,9 @@ struct UDPQuality
     {
         whoami = EndpointType::CLIENT;
         talkingTo = EndpointType::SERVER;
-        burstCount = args.bytesPerBurst / DATA_PACKET_SIZE;
+        burstCount = args.bytesPerBurst / args.mtu;
         if (args.talkback > 0) {
-            talkbackCount = args.talkback / DATA_PACKET_SIZE;
+            talkbackCount = args.talkback / args.mtu;
         }
 
         rpp::ipaddress toServer = args.serverAddr;
@@ -220,7 +227,7 @@ struct UDPQuality
         // with count=5, statusIteration will be 1,2,3,4,5
         for (statusIteration = 1; statusIteration <= args.count; )
         {
-            int32_t totalSize = DATA_PACKET_SIZE * burstCount;
+            int32_t totalSize = args.mtu * burstCount;
             LogInfo(MAGENTA(">> SEND BURST pkts:%d  size:%s  rate:%s"), 
                     burstCount, toLiteral(totalSize), toRateLiteral(args.bytesPerSec));
             sendStatusPacket(StatusType::BURST_START, actualServer);
@@ -270,7 +277,7 @@ struct UDPQuality
             // we want to be aware that we receive too many packets
             int32_t numTalkback = talkbackCount + (args.echo ? burstCount : 0);
             if (numTalkback > 0) {
-                int32_t expectedTalkbackBytes = numTalkback * DATA_PACKET_SIZE;
+                int32_t expectedTalkbackBytes = numTalkback * args.mtu;
                 int32_t minTalkbackMs = (expectedTalkbackBytes * 1000) / actualBytesPerSec;
                 LogInfo(MAGENTA(">> WAITING TALKBACK %dms expected:%dpkts"), minTalkbackMs, numTalkback);
                 waitAndRecvForDuration(minTalkbackMs);
@@ -348,7 +355,7 @@ struct UDPQuality
                     talkbackRemaining = talkbackCount;
                     if (talkbackRemaining > 0) {
                         LogInfo("   SEND TALKBACK pkts:%d  size:%s  rate:%s", 
-                            talkbackCount, toLiteral(talkbackCount*DATA_PACKET_SIZE),
+                            talkbackCount, toLiteral(talkbackCount*args.mtu),
                             toRateLiteral(c.getRateLimit()));
                     }
                     sendStatusPacket(StatusType::BURST_START, clientAddr);
@@ -459,9 +466,9 @@ struct UDPQuality
     void printReceivedAt(const char* at, int32_t expected, int32_t actual) noexcept {
         int lost = expected - actual;
         float p = 100.0f * (float(actual) / std::max(expected,1));
-        if      (p > 99.99f) LogInfo(GREEN( "   %s RECEIVED: %6.2f%% %4dpkts  LOST: %6.2f%% %dpkts"), at, p, actual, 100-p, lost);
-        else if (p > 90.0f)  LogInfo(ORANGE("   %s RECEIVED: %6.2f%% %4dpkts  LOST: %6.2f%% %dpkts"), at, p, actual, 100-p, lost);
-        else                 LogInfo(RED(   "   %s RECEIVED: %6.2f%% %4dpkts  LOST: %6.2f%% %dpkts"), at, p, actual, 100-p, lost);
+        if      (p > 99.99f) LogInfo(GREEN( "   %s RECEIVED: %6.2f%% %5dpkts  LOST: %6.2f%% %dpkts"), at, p, actual, 100-p, lost);
+        else if (p > 90.0f)  LogInfo(ORANGE("   %s RECEIVED: %6.2f%% %5dpkts  LOST: %6.2f%% %dpkts"), at, p, actual, 100-p, lost);
+        else                 LogInfo(RED(   "   %s RECEIVED: %6.2f%% %5dpkts  LOST: %6.2f%% %dpkts"), at, p, actual, 100-p, lost);
     }
 };
 
@@ -508,9 +515,19 @@ int main(int argc, char *argv[])
         else if (arg == "--blocking")    args.blocking = true;
         else if (arg == "--nonblocking") args.blocking = false;
         else if (arg == "--echo")        args.echo = true;
-        else if (arg == "--udpc")        args.udpc = true;
+        else if (arg == "--mtu") {
+            args.mtu = next_arg(&i).to_int();
+            if (args.mtu <= 0) {
+                LogError("invalid mtu %d", args.mtu);
+                printHelp(1);
+            }
+        }
+        else if (arg == "--udpc") args.udpc = true;
         else if (arg == "--help") printHelp(0);
-        else                      printHelp(1);
+        else {
+            LogError("unknown argument: %s", arg);
+            printHelp(1);
+        }
     }
 
     int modes = (args.is_server + args.is_client + args.is_bridge);

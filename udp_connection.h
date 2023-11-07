@@ -101,8 +101,8 @@ struct UDPConnection
         // validate the packet
         Packet& p = getReceivedPacket();
         if ((p.type != PacketType::DATA && p.type != PacketType::STATUS) ||
-            (p.type == PacketType::DATA && r != DATA_PACKET_SIZE) ||
-            (p.type == PacketType::STATUS && r != STATUS_PACKET_SIZE)) {
+            (p.type == PacketType::DATA && r != p.len) ||
+            (p.type == PacketType::STATUS && r != sizeof(Packet))) {
             LogInfo(ORANGE("recv invalid packet (size=%d) from %s: type=%d seqid=%d"),
                     r, sentFrom.str(), int(p.type), p.seqid);
             return -1;
