@@ -48,3 +48,38 @@ Options:
         1000 = 1000 bytes   1KB  = 1000 bytes   1MB  = 1000*1000 bytes
                             1KiB = 1024 bytes   1MiB = 1024*1024 bytes
 ```
+
+IP address information and tools
+```
+#CV25:             172.16.223.20
+#GROUNDSTATION:    172.16.223.10
+# CV25 eth0
+ifconfig eth0 172.16.223.20 netmask 255.255.255.0
+
+# These can be used to configure LAN settings on CV25
+tc qdisc show dev eth0
+tc qdisc del dev eth0 root
+tc qdisc add dev eth0 root tbf rate 20mbit burst 32kb latency 400ms
+ethtool -s eth0 autoneg on speed 10 duplex full
+ethtool -s eth0 autoneg on speed 100 duplex full
+```
+
+Useful ways to run the tool:
+```
+SERVER (typically CV25)
+    HILINK/CV25: udp_quality --server 9999 --buf 1000KB
+    DESKTOP/WSL: mama build start="--server 9999 --buf 1000KB"
+
+CLIENT (typically Windows or WSL)
+    DESKTOP:   mama start="--client 192.168.1.52:8888 --size 1000KB --talkback 1000KB --rate 1000KB --buf 1000KB"
+               mama start="--client 127.0.0.1 --count 5 --size 500KB --talkback 100KB --rate 500KB"
+
+    CV25:       udp_quality --client 172.16.223.15:8888 --size 5000KB --talkback 50KB --rate 0KB
+                udp_quality --client 172.16.223.19:8888 --count 5 --size 500KB --talkback 100KB --rate 500KB
+    CV25_TO_PC:     udp_quality --client 172.16.223.12:9999 --size 5000KB --talkback 50KB --rate 0KB
+
+BRIDGE (if you need to bridge between several networks)
+    # --bridge <listen_port> <forward_to_server_ip>
+    udp_quality --bridge 8888 172.16.223.20:9999 --buf 1000KB
+    mama start="--bridge 8888 172.16.223.20:9999 --buf 1000KB"
+```
