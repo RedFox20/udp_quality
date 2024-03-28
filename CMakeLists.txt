@@ -12,8 +12,21 @@ set(CMAKE_CXX_EXTENSIONS ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON) # for clang-tidy
 find_package(Threads REQUIRED)
 
+if(OCLEA)
+    set(CMAKE_SHARED_LINKER_FLAGS "-Wl,--as-needed")
+    set(CMAKE_EXE_LINKER_FLAGS "-Wl,--as-needed")
+    set(CMAKE_BUILD_WITH_INSTALL_RPATH TRUE)
+
+    # TODO: Currently using DOCKER based hard-coded oclea.cmake
+    # TODO: perhaps in the future we can have something modular
+    include(/build/workspace-cv25/oclea.cmake)
+    set(THIRDPARTY_LIBS
+        ${LIBDW_DEPS} # required by ReCpp
+    )
+endif()
+
 add_executable(udp_quality main_udp_quality.cpp simple_udp.cpp)
-target_link_libraries(udp_quality ${MAMA_LIBS} Threads::Threads)
+target_link_libraries(udp_quality ${MAMA_LIBS} ${THIRDPARTY_LIBS} Threads::Threads)
 if(OCLEA)
     set(EXE_OUT bin/cv25)
 elseif(MIPS)
