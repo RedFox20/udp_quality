@@ -64,7 +64,7 @@ struct UDPConnection
 
     Packet& getReceivedPacket() noexcept { return *reinterpret_cast<Packet*>(buffer); }
 
-    bool pollRead(int timeoutMillis = 0) const noexcept
+    bool pollRead(int timeoutMillis = 0) noexcept
     {
         return useRpp ? socket.poll(timeoutMillis, rpp::socket::PF_Read)
                       : socket_poll_recv(c_sock, timeoutMillis);
