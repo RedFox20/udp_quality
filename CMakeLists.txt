@@ -27,11 +27,7 @@ endif()
 
 add_executable(udp_quality main_udp_quality.cpp simple_udp.cpp)
 target_link_libraries(udp_quality ${MAMA_LIBS} ${THIRDPARTY_LIBS} Threads::Threads)
-if(OCLEA)
-    set(EXE_OUT bin/cv25)
-elseif(MIPS)
-    set(EXE_OUT bin/mips)
-else()
-    set(EXE_OUT bin)
-endif()
+set_target_properties(udp_quality PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+)
 install(TARGETS udp_quality DESTINATION bin)
