@@ -25,9 +25,7 @@ if(OCLEA)
     )
 endif()
 
+message(STATUS "BINARY_DIR: ${CMAKE_BINARY_DIR}")
 add_executable(udp_quality main_udp_quality.cpp simple_udp.cpp)
 target_link_libraries(udp_quality ${MAMA_LIBS} ${THIRDPARTY_LIBS} Threads::Threads)
-set_target_properties(udp_quality PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
-)
 install(TARGETS udp_quality DESTINATION bin)
