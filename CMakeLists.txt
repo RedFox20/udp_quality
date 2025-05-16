@@ -19,7 +19,12 @@ if(OCLEA)
 
     # TODO: Currently using DOCKER based hard-coded oclea.cmake
     # TODO: perhaps in the future we can have something modular
-    include(/build/workspace-cv25/oclea.cmake)
+    if (OCLEA_YOCTO)
+        include(/opt/oclea/1.0/oclea_yocto.cmake)
+    else()
+        include(/build/workspace-cv25/oclea.cmake)
+    endif()
+    
     set(THIRDPARTY_LIBS
         ${LIBDW_DEPS} # required by ReCpp
     )
