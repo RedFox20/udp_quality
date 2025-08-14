@@ -17,14 +17,8 @@ if(OCLEA)
     set(CMAKE_EXE_LINKER_FLAGS "-Wl,--as-needed")
     set(CMAKE_BUILD_WITH_INSTALL_RPATH TRUE)
 
-    # TODO: Currently using DOCKER based hard-coded oclea.cmake
-    # TODO: perhaps in the future we can have something modular
-    if (OCLEA_YOCTO)
-        include(/opt/oclea/1.0/oclea_yocto.cmake)
-    else()
-        include(/build/workspace-cv25/oclea.cmake)
-    endif()
-    
+    include(/opt/oclea/1.0/oclea_yocto.cmake)
+
     set(THIRDPARTY_LIBS
         ${LIBDW_DEPS} # required by ReCpp
     )
