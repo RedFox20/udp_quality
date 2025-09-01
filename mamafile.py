@@ -23,6 +23,7 @@ class udp_quality(mama.BuildTarget):
 
     def package(self):
         self.export_libs('bin', ['udp_quality', 'udp_quality.exe'])
+        self.no_export_includes()
 
     def start(self, args):
         self.run_program(self.build_dir(), f'bin/udp_quality {args}')
