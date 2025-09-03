@@ -12,6 +12,14 @@ set(CMAKE_CXX_EXTENSIONS ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON) # for clang-tidy
 find_package(Threads REQUIRED)
 
+if((CLANG OR GCC) AND (CMAKE_SYSTEM_PROCESSOR STREQUAL "x86_64"))
+    # -march=x86-64-v3: (close to Haswell) AVX, AVX2, BMI1, BMI2, F16C, FMA, LZCNT, MOVBE, XSAVE
+    # -march=x86-64-v4: AVX512F, AVX512BW, AVX512CD, AVX512DQ, AVX512VL (generally not available on VM-s in 2023)
+    # NOTE: on Alder Lake and later, AVX512 is no longer supported! So to support broken Intel CPU-s we cannot have AVX512
+    add_compile_options(-march=x86-64-v3)
+    message(STATUS "BUGFIX: Using -march=x86-64-v3 for backwards compatibility")
+endif()
+
 if(OCLEA)
     set(CMAKE_SHARED_LINKER_FLAGS "-Wl,--as-needed")
     set(CMAKE_EXE_LINKER_FLAGS "-Wl,--as-needed")
