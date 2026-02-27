@@ -12,11 +12,6 @@ set(CMAKE_CXX_EXTENSIONS ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON) # for clang-tidy
 find_package(Threads REQUIRED)
 
-if(OCLEA OR XILINX)
-    add_compile_definitions(YOCTO_LINUX=1)
-    set(YOCTO_LINUX ON)
-endif()
-
 if((CLANG OR GCC) AND (CMAKE_SYSTEM_PROCESSOR STREQUAL "x86_64"))
     # -march=x86-64-v3: (close to Haswell) AVX, AVX2, BMI1, BMI2, F16C, FMA, LZCNT, MOVBE, XSAVE
     # -march=x86-64-v4: AVX512F, AVX512BW, AVX512CD, AVX512DQ, AVX512VL (generally not available on VM-s in 2023)
@@ -33,16 +28,6 @@ endif()
 
 if(OCLEA)
     include(/opt/oclea/1.0/oclea_yocto.cmake)
-
-    set(THIRDPARTY_LIBS
-        ${LIBDW_DEPS} # required by ReCpp
-    )
-endif()
-
-if(XILINX) 
-    set(THIRDPARTY_LIBS ${THIRDPARTY_LIBS}
-        dw elf z # required by ReCpp
-    )
 endif()
 
 message(STATUS "BINARY_DIR: ${CMAKE_BINARY_DIR}")
